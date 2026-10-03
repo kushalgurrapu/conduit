@@ -1,0 +1,14 @@
+spring:
+  application:
+    name: durable-workflow-engine
+  datasource:
+    url: jdbc:postgresql://localhost:5432/durable_workflow
+    username: workflow
+    password: workflow
+  flyway:
+    enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info
