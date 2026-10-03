@@ -49,15 +49,16 @@ introduced when it solves a real problem in the current milestone.
 -   Spring JDBC / `JdbcClient`
 -   Flyway
 -   Docker
+-   Docker Compose (local PostgreSQL)
 -   REST/HTTP
+-   JUnit 5
+-   Testcontainers (PostgreSQL 16)
 
 ### Planned
 
--   JUnit
--   Testcontainers
 -   Redis, if/when justified
 -   React + TypeScript frontend
--   Docker Compose
+-   Docker Compose for the full stack (application, workers, observability)
 -   OpenTelemetry
 -   Prometheus/Grafana
 -   GitHub Actions
@@ -136,13 +137,18 @@ It currently handles:
 Tasks currently have the following fields:
 
 ``` text
-id
-status
-payload
-created_at
-claimed_at
-worker_id
+id          uuid
+status      text, limited by a CHECK constraint (see below)
+payload     jsonb
+created_at  timestamptz
+claimed_at  timestamptz, NULL until the task is claimed
+updated_at  timestamptz
+worker_id   uuid, NULL until the task is claimed
 ```
+
+The database only accepts these statuses: `PENDING`, `RUNNING`,
+`COMPLETED`, `FAILED`, and `CANCELLED`. The application currently only
+produces `PENDING` and `RUNNING`.
 
 A task begins in:
 
@@ -156,7 +162,8 @@ When a worker successfully claims it:
 RUNNING
 ```
 
-The intended future lifecycle is:
+There is no complete or fail operation yet, so a claimed task stays
+`RUNNING`. The intended future lifecycle is:
 
 ``` text
 PENDING
@@ -169,17 +176,42 @@ RUNNING
    +------> FAILED
 ```
 
-Additional states may be introduced later if they are justified by the
-workflow requirements.
+The schema also allows `CANCELLED`, but nothing sets it yet. Further
+states may be introduced later if they are justified by the workflow
+requirements.
 
 ## Database
 
-PostgreSQL is currently running through Docker.
+PostgreSQL runs locally through Docker Compose (`docker-compose.yml`:
+image `postgres:16-alpine`, database `durable_workflow`, port 5432, data
+kept in the named volume `pgdata`).
 
-The initial Flyway migration creates the `tasks` table and enables
-PostgreSQL's `pgcrypto` extension for UUID generation.
+Flyway migrations in `src/main/resources/db/migration` build the schema:
+
+-   `V1` creates the `tasks` table and enables PostgreSQL's `pgcrypto`
+    extension for UUID generation.
+-   `V2` fixes the default on `claimed_at`.
+-   `V3` converts `created_at` and `claimed_at` to `timestamptz`, adds
+    `updated_at`, adds the `CHECK` constraint on `status`, and adds the
+    partial index `idx_tasks_pending` on `created_at` for pending rows.
+
+The datasource is read from `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`.
+The defaults match the Compose database, so the application runs without
+setting them. Integration tests do not use these settings; they start a
+temporary PostgreSQL container through Testcontainers.
 
 The database is intentionally the source of truth for task state.
+
+### Running locally
+
+``` text
+docker compose up -d
+./mvnw spring-boot:run
+./mvnw verify
+```
+
+Use `.\mvnw.cmd` on Windows. `verify` needs Docker running (for
+Testcontainers) but does not need the Compose database.
 
 ## Concurrent Task Claiming
 
@@ -232,6 +264,23 @@ lock Task 1
 
 This allows multiple workers to make progress concurrently.
 
+### How this is tested
+
+-   `ConcurrentTaskClaimTest` has many threads claim from a set of
+    pending tasks at once and asserts that no task is claimed twice and
+    every task is claimed. A claim that waited on a lock would also pass
+    this test, so on its own it does not prove `SKIP LOCKED`.
+-   `SkipLockedClaimTest` holds a row lock on the oldest pending task in
+    a separate, uncommitted JDBC transaction and asserts that
+    `claimTask` returns the next task (or `null` if every pending task is
+    locked) instead of waiting. Removing `SKIP LOCKED` makes it fail
+    because of a short `statement_timeout`.
+-   `DurableWorkflowEngineApplicationTests` checks that the application
+    context starts and the migrations apply to a fresh database.
+
+All of them extend `PostgresIntegrationTest`, which provides one shared
+Testcontainers PostgreSQL container.
+
 ## Verified So Far
 
 The current implementation has successfully demonstrated:
@@ -246,6 +295,13 @@ The current implementation has successfully demonstrated:
 -   `claimed_at` is populated
 -   `worker_id` is populated
 -   the updated task is returned to the caller
+-   concurrent workers never claim the same task twice
+    (`ConcurrentTaskClaimTest`)
+-   a task locked by another transaction is skipped, not waited on
+    (`SkipLockedClaimTest`)
+-   all Flyway migrations apply to a fresh database
+-   integration tests run against Testcontainers, with no local database
+    required
 
 Example successful state transition:
 
@@ -266,21 +322,31 @@ worker_id  = <worker UUID>
 
 ## Current Milestone
 
-The basic task-claiming mechanism is complete.
+**M0 --- Foundation hardening** (in progress). See `PROJECT_ROADMAP.md`.
 
-The next milestone is to **prove the concurrency behavior
-experimentally**.
+The basic task-claiming mechanism is complete, and its concurrency
+behavior has been verified by tests. M0 makes that base reproducible and
+trustworthy before new behavior is added.
 
-The next work should:
+Done in M0 so far:
 
-1.  Create multiple pending tasks.
-2.  Simulate multiple workers.
-3.  Have workers attempt to claim tasks concurrently.
-4.  Verify that workers do not claim the same task.
-5.  Verify that locked tasks are skipped.
-6.  Turn the successful claim operation into an actual worker loop.
+-   package renamed to `com.kushal.workflow`
+-   `V3__task_hardening.sql` (`timestamptz`, `updated_at`, status
+    `CHECK`, partial index for pending tasks) and `Instant` in Java
+-   one shared Testcontainers PostgreSQL instance for all integration
+    tests
+-   a deterministic test that fails if `SKIP LOCKED` is removed
+-   `docker-compose.yml` and environment-based datasource settings
+-   `.gitattributes` line-ending normalization
+-   Maven project name and description
+-   this documentation and the first architecture decision records
 
-After that, the project will move toward:
+Still open in M0: a GitHub Actions workflow that runs `./mvnw verify`.
+There is no CI yet.
+
+The next milestone is M1, the task lifecycle: complete and fail
+operations, a validated REST API, and error handling. After that, the
+project will turn the claim operation into a worker loop and move toward:
 
 ``` text
 Worker
@@ -310,7 +376,8 @@ The project should progress roughly in this order:
 -   [x] Transactional task claiming
 -   [x] `FOR UPDATE SKIP LOCKED`
 -   [x] Verify a task can be claimed
--   [ ] Concurrent worker test
+-   [x] Concurrent worker test
+-   [x] Deterministic `SKIP LOCKED` test
 
 ### Phase 2 --- Workers
 
@@ -375,7 +442,7 @@ Important principle:
 
 -   [ ] React + TypeScript UI
 -   [ ] Workflow/run dashboard
--   [ ] Docker Compose
+-   [ ] Docker Compose for the full stack (a PostgreSQL-only Compose file already exists)
 -   [ ] CI/CD
 -   [ ] Production deployment
 
@@ -434,22 +501,40 @@ In particular, the developer should understand:
 AI-generated code should be reviewed and tested rather than accepted
 blindly.
 
+## Architecture Decision Records
+
+Key design decisions are recorded in `docs/adr/`:
+
+-   [0001 --- PostgreSQL as the task store and queue](docs/adr/0001-postgres-as-queue.md)
+-   [0002 --- At-least-once execution](docs/adr/0002-at-least-once.md)
+-   [0003 --- Fencing via the attempt counter](docs/adr/0003-fencing-via-attempt.md)
+
+ADRs 0002 and 0003 describe planned behavior for later milestones, not
+what the code does today. Each one says so explicitly.
+
 ## Repository Structure
 
-The project is expected to evolve toward something similar to:
+Current layout (abbreviated):
 
 ``` text
 durable-workflow-engine/
 ├── README.md
 ├── PROJECT_CONTEXT.md
-├── docs/
-├── src/
-│   ├── main/
-│   │   ├── java/
-│   │   └── resources/
-│   └── test/
+├── PROJECT_ROADMAP.md
+├── docker-compose.yml
 ├── pom.xml
-└── docker-compose.yml
+├── docs/
+│   └── adr/
+└── src/
+    ├── main/
+    │   ├── java/com/kushal/workflow/
+    │   │   └── task/
+    │   └── resources/
+    │       └── db/migration/
+    └── test/
+        └── java/com/kushal/workflow/
+            ├── support/
+            └── task/
 ```
 
 The exact structure should evolve with the application rather than being
@@ -457,11 +542,14 @@ created all at once.
 
 ## Current Status
 
-**Milestone: Basic task creation and transactional task claiming**
+**Milestone: M0 --- Foundation hardening (in progress)**
 
 The system can currently create a task, store it in PostgreSQL, safely
 claim a pending task using PostgreSQL row locking, and return the
-resulting task.
+resulting task. Concurrent claiming is covered by integration tests that
+run against Testcontainers.
 
-The immediate goal is to demonstrate that this behavior remains correct
-when multiple workers operate concurrently.
+Not built yet: completing or failing a task, a worker loop, attempts,
+leases, heartbeats, recovery of abandoned tasks, fencing, retries,
+idempotency, and CI. A worker that dies after claiming a task leaves it
+in `RUNNING` forever. These are the subject of later milestones.
