@@ -1,14 +1,14 @@
 package com.kushal.workflow.task;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.UUID;
 
 public record Task(
         UUID id,
         String status,
         String payload,
-        LocalDateTime createdAt,
-        LocalDateTime claimedAt,
+        Instant createdAt,
+        Instant claimedAt,
         UUID workerId
 ) {
 }

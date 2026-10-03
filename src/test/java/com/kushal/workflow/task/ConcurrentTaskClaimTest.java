@@ -1,16 +1,14 @@
 package com.kushal.workflow.task;
 
+import com.kushal.workflow.support.PostgresIntegrationTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.test.context.TestPropertySource;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -54,19 +52,14 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  * worker, and repeated rounds make a missing lock likely to fail uniqueness,
  * but one unlucky run can still pass if the transactions never overlap.
  */
-@Testcontainers
 @SpringBootTest
 @TestPropertySource(properties = "spring.datasource.hikari.maximum-pool-size=30")
-class ConcurrentTaskClaimTest {
+class ConcurrentTaskClaimTest extends PostgresIntegrationTest {
 
     private static final int TASK_COUNT = 20;
     private static final int SURPLUS_WORKERS = 4;
     private static final int ROUNDS = 10;
     private static final long CLAIM_TIMEOUT_SECONDS = 15;
-
-    @Container
-    @ServiceConnection
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
 
     @Autowired
     private TaskService taskService;
@@ -168,7 +161,7 @@ class ConcurrentTaskClaimTest {
                     .query((rs, rowNum) -> new StoredTask(
                             rs.getObject("id", UUID.class),
                             rs.getString("status"),
-                            rs.getObject("claimed_at", LocalDateTime.class),
+                            toInstant(rs.getObject("claimed_at", OffsetDateTime.class)),
                             rs.getObject("worker_id", UUID.class)
                     ))
                     .single());
@@ -184,6 +177,10 @@ class ConcurrentTaskClaimTest {
         }
     }
 
-    private record StoredTask(UUID id, String status, LocalDateTime claimedAt, UUID workerId) {
+    private record StoredTask(UUID id, String status, Instant claimedAt, UUID workerId) {
+    }
+
+    private static Instant toInstant(OffsetDateTime value) {
+        return value == null ? null : value.toInstant();
     }
 }
