@@ -1,4 +1,4 @@
-package durable_workflow_engine.task;
+package com.kushal.workflow.task;
 
 import org.springframework.web.bind.annotation.*;
 import java.util.UUID;

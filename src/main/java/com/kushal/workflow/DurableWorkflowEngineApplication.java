@@ -1,4 +1,4 @@
-package durable_workflow_engine;
+package com.kushal.workflow;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;

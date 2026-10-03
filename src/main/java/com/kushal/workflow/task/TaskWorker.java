@@ -1,4 +1,4 @@
-package durable_workflow_engine.task;
+package com.kushal.workflow.task;
 
 import org.springframework.stereotype.Component;
 
