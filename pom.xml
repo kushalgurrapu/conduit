@@ -11,8 +11,14 @@
 	<groupId>com.kushal</groupId>
 	<artifactId>durable-workflow-engine</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<name/>
-	<description/>
+	<name>Durable Workflow Engine</name>
+	<description>A durable task and workflow execution engine built with Java, Spring Boot, and PostgreSQL. Workers claim tasks transactionally using FOR UPDATE SKIP LOCKED.</description>
+	<!--
+		The empty url, licenses, developers, and scm elements below are deliberate.
+		They override the values inherited from spring-boot-starter-parent
+		(Apache-2.0, VMware developers, Spring Boot SCM and URL), which do not
+		describe this project. Fill them in with real values when they exist.
+	-->
 	<url/>
 	<licenses>
 		<license/>
