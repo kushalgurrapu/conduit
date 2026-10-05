@@ -8,6 +8,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -80,6 +81,79 @@ public class TaskRepository {
                 .query(TASK_ROW_MAPPER)
                 .optional()
                 .orElse(null);
+    }
+
+    public Optional<Task> findById(UUID id) {
+        return jdbcClient.sql("""
+                SELECT
+                %s
+                FROM tasks
+                WHERE id = :id
+                """.formatted(TASK_COLUMNS))
+                .param("id", id)
+                .query(TASK_ROW_MAPPER)
+                .optional();
+    }
+
+    /**
+     * One update per transition. The {@code WHERE} clause is what makes the
+     * transition legal. An empty result means the row did not change; the
+     * service names that outcome and does not try the update again.
+     */
+    public Optional<Task> completeTask(UUID id, UUID workerId, String result) {
+        return jdbcClient.sql("""
+                UPDATE tasks
+                SET status = 'COMPLETED',
+                    result = CAST(:result AS jsonb),
+                    finished_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :id
+                  AND status = 'RUNNING'
+                  AND worker_id = :workerId
+                RETURNING
+                %s
+                """.formatted(TASK_COLUMNS))
+                .param("id", id)
+                .param("workerId", workerId)
+                .param("result", result)
+                .query(TASK_ROW_MAPPER)
+                .optional();
+    }
+
+    public Optional<Task> failTask(UUID id, UUID workerId, String error) {
+        return jdbcClient.sql("""
+                UPDATE tasks
+                SET status = 'FAILED',
+                    error = left(:error, 4000),
+                    finished_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :id
+                  AND status = 'RUNNING'
+                  AND worker_id = :workerId
+                RETURNING
+                %s
+                """.formatted(TASK_COLUMNS))
+                .param("id", id)
+                .param("workerId", workerId)
+                .param("error", error)
+                .query(TASK_ROW_MAPPER)
+                .optional();
+    }
+
+    public Optional<Task> cancelTask(UUID id) {
+        return jdbcClient.sql("""
+                UPDATE tasks
+                SET status = 'CANCELLED',
+                    finished_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :id
+                  AND status = 'PENDING'
+                RETURNING
+                %s
+                """.formatted(TASK_COLUMNS))
+                .param("id", id)
+                .query(TASK_ROW_MAPPER)
+                .optional();
     }
 
     private static String taskColumns(String alias) {
