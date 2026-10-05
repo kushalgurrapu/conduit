@@ -4,6 +4,8 @@ This roadmap was written on 2026-10-02 from a read of the repo at that time: `po
 
 **How agents should use this file:** implement ONE milestone at a time (M0, M1, ...). Re-inspect the repository first, since it is the source of truth and may have moved past section 0. Follow the milestone's "Definition of done" and the architecture decisions in section 1, and respect the "do NOT build" list in section 2. Follow the AI Development Rule in `PROJECT_CONTEXT.md` (explain architectural changes before making them).
 
+**Update (M1.0, 2026-10-05):** M0 is complete, including GitHub Actions (`.github/workflows/ci.yml` runs `./mvnw verify` with a 20-minute job timeout). Roadmap M2 is merged into M1. Deviations from the original M1-M4 text are in the table under M1, and the lifecycle model is ADR 0004. That behavior is not implemented. Section 0 below is the 2026-10-02 audit, not the current tree.
+
 ---
 
 ## 0. Where the repo actually is today
@@ -58,7 +60,7 @@ These keep later milestones coherent. Record each as a short ADR in `docs/adr/` 
 3. **Fencing token = `attempt` counter.** `attempt` is incremented only on claim. Every state-changing write is guarded by `WHERE id=? AND status='RUNNING' AND worker_id=? AND attempt=?`. If zero rows are updated, the caller is stale.
 4. **The database clock is the only clock for leases.** Use `now()`/`clock_timestamp()` in SQL, never the JVM clock, so worker clock skew cannot break lease logic.
 5. **Never hold a transaction or DB connection while executing user logic.** The pattern is: claim (short tx) → execute (no tx) → complete (short tx).
-6. **Guarantee statement (goes in the README):** at-least-once execution, with stale-worker writes rejected, and effectively-once results through idempotency keys. It will not claim exactly-once.
+6. **Guarantee statement (goes in the README once recovery and idempotency exist):** at-least-once execution, with stale-worker writes rejected, and effectively-once results through idempotency keys. It will not claim exactly-once. M1 must not put this sentence in the README. M1's honest guarantees are the narrower list in ADR 0004 (a crash leaves the task `RUNNING`; at-least-once is M4).
 7. **One deployable, role-switchable.** A modular monolith with a config switch (`engine.role=api|worker|all`) lets the same jar scale API and workers separately. No microservices.
 8. **Status vocabulary:** `PENDING`, `RUNNING`, `COMPLETED`, `FAILED` (terminal after retries, which is the dead-letter state), `CANCELLED`. A retry is `RUNNING → PENDING` with `available_at` in the future. Status is stored as text with a `CHECK` constraint and mirrored by a Java enum.
 
@@ -120,9 +122,8 @@ These keep later milestones coherent. Record each as a short ADR in `docs/adr/` 
 
 ```mermaid
 flowchart TD
-    M0[M0 Hardening] --> M1[M1 Lifecycle and API]
-    M1 --> M2[M2 Worker runtime]
-    M2 --> M3[M3 Leases and heartbeats]
+    M0[M0 Hardening] --> M1[M1 Lifecycle, API, and workers]
+    M1 --> M3[M3 Leases and heartbeats]
     M3 --> M4[M4 Recovery and fencing]
     M4 --> M5[M5 Retries and backoff]
     M5 --> M6[M6 Idempotency]
@@ -142,7 +143,7 @@ flowchart TD
     M15 --> M16[M16 Portfolio polish]
 ```
 
-Notes: M11 can start after M8 (basic metrics) and be completed after M10. M13 can start any time after M12. M0 to M6 are strictly sequential.
+Notes: M11 can start after M8 (basic metrics) and be completed after M10. M13 can start any time after M12. M0, then M1 (former M2 included), then M3 through M6 are strictly sequential. Roadmap M2 is not a separate milestone.
 
 ---
 
@@ -151,8 +152,8 @@ Notes: M11 can start after M8 (basic metrics) and be completed after M10. M13 ca
 Estimates assume one person at 10-15 hours/week with AI assistance. They include learning time, reading and understanding generated code, and writing tests (the slowest part).
 
 - M0 Hardening: Small, 1 week
-- M1 Task lifecycle and API: Small to Medium, 1-1.5 weeks
-- M2 Worker runtime: Medium, 1.5-2 weeks
+- M1 Task lifecycle, API, and worker runtime (M2 merged here): Medium, about 2.5-3.5 weeks (the original 1-1.5 plus 1.5-2)
+- M2: merged into M1; do not schedule it separately
 - M3 Leases and heartbeats: Medium, 1.5-2 weeks
 - M4 Crash recovery and fencing: Large, 2-3 weeks
 - M5 Retries, backoff, dead letter: Medium, 1.5-2 weeks
@@ -231,13 +232,35 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 
 ---
 
-## M1. Task lifecycle and a proper API
+## M1. Task lifecycle, API, and worker runtime
 
-**Complexity:** Small to Medium. **Time:** 1-1.5 weeks. **Depends on:** M0.
+**Complexity:** Medium. **Time:** original M1 (1-1.5 weeks) plus former M2 (1.5-2 weeks), implemented as M1.0-M1.6. **Depends on:** M0.
+
+Roadmap **M2 is merged into this milestone**. M3 and later keep their numbers. Where the original bullets below disagree with the deviations table or with ADR 0004, those win. M1.0 records the decisions only; it does not implement them.
 
 **Goal**
 - Complete the task state machine: a task can finish successfully or fail, and clients can observe it.
+- Run that work on a bounded worker pool: claim, execute with no connection held, then one finish write.
 - Replace the test-only API with a real, validated REST API.
+
+### Recorded deviations (M1.0)
+
+These replace the original roadmap text where they conflict. ADR 0004 is the decision record.
+
+| Roadmap says | M1 does | Why |
+| --- | --- | --- |
+| Separate M1 then M2 | Merged into this M1 | The executor needs complete/fail, and the API needs a worker to be demoable |
+| `completed_at` | `finished_at` | `FAILED` and `CANCELLED` also need a terminal time |
+| Cancel already-`CANCELLED` → `409` | `200` (idempotent) | Safer for clients; still `409` for `RUNNING` or another terminal status |
+| Offset list pagination | No list endpoint in minimum M1 | Keyset pagination is M12 |
+| Process-level `workerId` plus per-loop id | Per-loop UUID only | One loop, one thread, one id; fencing later uses `attempt`, not a process id |
+| Enforce a handler timeout (M2) | No timeout | Java cannot kill a thread; timeout → `FAILED` while the handler still runs would be a lie. Leases and a cancel signal are M3 |
+| Pool-starvation test / Hikari fail-fast | Document `pool ≥ concurrency + API headroom` | No connection is held during execute, so that starvation scenario does not apply |
+| `canTransitionTo` table | Deleted | One parametrized database test is the spec |
+| Throw `StaleClaimException` on zero rows (worker path) | Zero rows is a value | Matches ADR 0003 |
+| M4 reaper clears `worker_id` and `lease_expires_at` only | Reaper must also clear `claimed_at` | `tasks_pending_has_no_owner_check` |
+| M3 adds another RUNNING-has-owner CHECK | M3 **replaces** `tasks_running_has_owner_check` | Avoid two overlapping constraints |
+| `result`/`error` exclusivity CHECKs | Not in V4 | They block M5/M8 (`last_error`, a `FAILED` HTTP response body) |
 
 **Concepts to understand first**
 - State machines. Legal transitions are an invariant enforced in the database `WHERE` clause, not just in Java.
@@ -247,32 +270,33 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 - Why `jsonb` payloads should be validated as JSON at the edge.
 
 **Implementation tasks**
-- `TaskStatus` enum with a `canTransitionTo` table (unit-tested).
-- `TaskRepository`: `markCompleted(taskId, workerId, result)` and `markFailed(taskId, workerId, error)`, each a guarded `UPDATE ... RETURNING`/row-count; `findById`; `list(status, limit, cursor)`.
-- `TaskService`: `completeTask` and `failTask` (throw a domain `IllegalTaskTransitionException` or `StaleClaimException` on zero rows); keep `claimTask`.
+- `TaskStatus` enum with `isTerminal()` only. No `canTransitionTo` table. One parametrized database test is the transition spec.
+- `TaskRepository`: complete and fail as guarded `UPDATE ... RETURNING` statements; `findById`. No list query in minimum M1.
+- `TaskService`: complete and fail. On the worker path, zero rows is a value (applied, already applied, or rejected), not a thrown `StaleClaimException`. Do not retry a zero-row update. Keep `claimTask`.
 - DTOs: `CreateTaskRequest(taskType, payload)` (payload as `JsonNode`), `TaskResponse`.
 - `TaskController`: `POST /api/v1/tasks` → `201` + `Location`; `GET /api/v1/tasks/{id}`; `GET /api/v1/tasks?status=`; `POST /tasks/{id}/cancel`.
 - `GlobalExceptionHandler` (`@RestControllerAdvice`) returning `ProblemDetail`.
-- Move claim/complete/fail onto an internal `/internal/**` path or remove the HTTP claim endpoint entirely (workers call the service directly, M2). Keep a dev-profile-only version if useful for manual testing.
-- Add `task_type text not null default 'NOOP'` now (needed by M2 handlers).
+- Remove `POST /tasks/claim`. Workers call the service directly. Do not keep an HTTP claim endpoint.
+- Add `task_type` in V4 (format-checked). Existing rows backfill to `NOOP`, then the column default is dropped.
 
 **Database changes**
-- `V4`: `task_type text not null default 'NOOP'`, `completed_at timestamptz`, `result jsonb`, `error text`.
-- Add `CHECK` so `COMPLETED` rows have `completed_at`.
+- `V4`: `task_type text` (temporary default `NOOP` for the backfill, then drop it), `finished_at timestamptz`, `result jsonb`, `error text`.
+- Named checks: `finished_at` is set if and only if the status is terminal (`COMPLETED`, `FAILED`, or `CANCELLED`); `RUNNING` has `worker_id` and `claimed_at`; `PENDING` has neither; `task_type` matches `^[A-Z][A-Z0-9_]{0,63}$`.
+- No `result`/`error` exclusivity checks. They would block `last_error` (M5) and a `FAILED` row that still stores an HTTP response body (M8).
 
 **API changes**
 - `POST /api/v1/tasks` → `201 Created`, body `TaskResponse`, `Location: /api/v1/tasks/{id}`.
 - `GET /api/v1/tasks/{id}` → `200` or `404`.
-- `GET /api/v1/tasks?status=PENDING&limit=50` → list (offset first; keyset pagination comes in M12).
-- `POST /api/v1/tasks/{id}/cancel` → `200` if `PENDING`, `409` otherwise.
+- No list endpoint in minimum M1. Keyset pagination stays in M12.
+- `POST /api/v1/tasks/{id}/cancel` → `200` if `PENDING` or already `CANCELLED`; `409` if `RUNNING` or another terminal status; `404` if missing.
 - Invalid JSON/unknown type → `400` with a `ProblemDetail`.
 
 **Testing strategy**
-- Unit: transition table; DTO validation.
+- DTO validation. No transition-table unit test.
 - Repository integration: complete only succeeds for the owning worker while `RUNNING`; second complete is a no-op/stale; complete on `PENDING` fails.
 - `@WebMvcTest` for controller status codes and error bodies.
 - Concurrency: two workers racing to complete the same task, so exactly one wins.
-- Invariant: terminal states are absorbing (no transition out of `COMPLETED`/`FAILED`/`CANCELLED`).
+- Invariant: terminal states are absorbing because each statement's `WHERE` requires the pre-state, not because a `CHECK` can see the previous status.
 
 **Failure modes**
 - Worker completes a task it no longer owns → rejected (`409`), not silently applied.
@@ -280,59 +304,28 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 - Malformed payload → `400`, never a DB error leaking as `500`.
 
 **Definition of done**
-- A task can be created, claimed, completed, or failed using only service/API calls.
-- All illegal transitions rejected and tested.
-- The random-UUID claim endpoint is gone or profile-gated.
+- A task can be created, claimed by a worker loop, executed, and completed or failed.
+- Illegal transitions are rejected by the SQL `WHERE` clause and covered by one parametrized database test.
+- `POST /tasks/claim` is gone.
+- Cancel of a pending or already-cancelled task returns 200; cancel of a running or other terminal task returns 409.
+- No list endpoint is required.
+- Graceful shutdown is tested: no new claims after stop, and a handler still running at the deadline stays `RUNNING`.
+- Docs state the ADR 0004 guarantees, including the limitation that a crash, an interrupt, or a failed finish write leaves the task `RUNNING`.
 
 **Interview/resume value:** state-machine invariants enforced at the data layer; compare-and-set; clean REST error handling.
 
 ---
 
-## M2. Real worker runtime
+## M2. Real worker runtime (merged into M1)
 
-**Complexity:** Medium. **Time:** 1.5-2 weeks. **Depends on:** M1.
+**Status:** merged into M1 (recorded M1.0, 2026-10-05). Do not implement M2 as its own milestone. M3 and later keep their numbers.
 
-**Goal**
-- Turn the `TaskWorker` placeholder into a real background worker pool that polls, claims, executes handlers, and completes or fails tasks.
-- This is the first end-to-end demo of the engine.
+The worker pool ships with the lifecycle and the REST API. The original goal still applies, as part of M1: a background pool that claims, executes, and finishes tasks, shuts down without claiming new work, and documents that a crash leaves the task `RUNNING`. ADR 0004 is the spec. The deviations table under M1 replaces the original M2 text, including:
 
-**Concepts to understand first**
-- Polling consumers, idle backoff, and jitter (don't hammer the DB when empty).
-- Thread pools and bounded concurrency; virtual threads (Java 21+) vs a fixed pool, and when blocking I/O makes virtual threads attractive.
-- Connection pool sizing. Each worker uses a connection only during claim/complete. Executing a handler while holding a transaction is the classic way to starve Hikari.
-- Graceful shutdown with `SmartLifecycle`: stop claiming, let in-flight work finish within a deadline.
-- Pull-based work distribution as natural backpressure.
-
-**Implementation tasks**
-- `WorkerProperties` (`@ConfigurationProperties("engine.worker")`): `enabled`, `concurrency`, `pollIntervalMs`, `maxIdleBackoffMs`, `shutdownTimeoutMs`.
-- `TaskHandler` interface (`String type()`; `TaskResult execute(TaskContext ctx)`) plus `TaskHandlerRegistry`.
-- `WorkerPool` (`SmartLifecycle`) that starts N worker loops; each loop is `claim → lookup handler → execute (no tx) → complete/fail`, with idle backoff.
-- A stable process-level `workerId` base (e.g., hostname + random suffix) plus a per-loop id for diagnostics.
-- Built-in demo handlers: `NOOP`, `SLEEP`, `FAIL` (for tests), `ECHO`.
-- Remove the `System.out`; use SLF4J with task/worker context.
-- Ensure `claim` and `complete` are separate short transactions; no `@Transactional` wraps the handler.
-
-**Database changes:** none required. Optionally add `idx` review for claim performance. Hikari pool size must be at least workers + headroom for the API (document it).
-
-**API changes:** none. Optionally `GET /actuator/health` includes a worker-pool indicator.
-
-**Testing strategy**
-- Integration: enqueue 100 tasks, start 8 workers, await all `COMPLETED` with Awaitility; assert each ran exactly once in the no-failure case.
-- Handler throws → task `FAILED` (retries come in M5) with error recorded.
-- Unknown `task_type` → task failed with a clear error (not an infinite loop).
-- Graceful shutdown test: a long-running task finishes before the pool closes; no new claims after shutdown starts.
-- Idle behavior: with an empty queue, the polling rate is bounded (count queries).
-- Pool-starvation test: worker count greater than pool size shows the failure, with the configured sizing as the fix.
-
-**Failure modes**
-- Handler throws or hangs. A hang is addressed by M3 leases; for now, enforce a handler timeout.
-- DB briefly unavailable → loop logs, backs off, and continues; never dies silently.
-- JVM killed mid-task → task stuck `RUNNING` forever (documented; M3-M4 fix it).
-
-**Definition of done**
-- `docker compose up` + app run processes tasks created through the API without manual calls.
-- Graceful shutdown is tested.
-- A known-limitation note in the docs: "crash leaves tasks RUNNING (fixed in M3-M4)".
+- One UUID per loop for that loop's lifetime. No separate process-level `workerId`.
+- No handler timeout, and no standalone `TaskHandlerRegistry`.
+- No pool-starvation test and no Hikari fail-fast bean. Document `maximum-pool-size` ≥ concurrency + API headroom.
+- Do not add Awaitility for this work.
 
 **Interview/resume value:** worker pools, backpressure by pull, connection-pool awareness, graceful shutdown.
 
@@ -344,7 +337,7 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 
 ## M3. Leases and heartbeats
 
-**Complexity:** Medium. **Time:** 1.5-2 weeks. **Depends on:** M2.
+**Complexity:** Medium. **Time:** 1.5-2 weeks. **Depends on:** M1 (the worker runtime is part of M1).
 
 **Goal**
 - A claim becomes a time-limited lease rather than a permanent ownership claim.
@@ -368,7 +361,7 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 **Database changes**
 - `V5`: `lease_expires_at timestamptz`, `attempt int not null default 0`, `last_heartbeat_at timestamptz`.
 - `CREATE INDEX idx_tasks_running_lease ON tasks (lease_expires_at) WHERE status = 'RUNNING';`
-- `CHECK` that `RUNNING` rows have non-null `worker_id` and `lease_expires_at`.
+- Replace `tasks_running_has_owner_check` (added in M1: `RUNNING` requires `worker_id` and `claimed_at`) with one check that also requires `lease_expires_at`. Do not add a second overlapping RUNNING-has-owner check.
 
 **API changes:** the task response gains `attempt`, `leaseExpiresAt`, `workerId`.
 
@@ -406,7 +399,7 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 - Alternative design: reclaim expired leases inside the claim query ("lazy reclaim"). Record the chosen approach in an ADR. Recommended: an explicit reaper, because it gives visibility and metrics.
 
 **Implementation tasks**
-- `LeaseReaper` (`@Scheduled`, or its own loop) running `UPDATE tasks SET status='PENDING', worker_id=NULL, lease_expires_at=NULL ... WHERE id IN (SELECT id FROM tasks WHERE status='RUNNING' AND lease_expires_at < now() ORDER BY lease_expires_at LIMIT :batch FOR UPDATE SKIP LOCKED) RETURNING id`.
+- `LeaseReaper` (`@Scheduled`, or its own loop) running `UPDATE tasks SET status='PENDING', worker_id=NULL, claimed_at=NULL, lease_expires_at=NULL ... WHERE id IN (SELECT id FROM tasks WHERE status='RUNNING' AND lease_expires_at < now() ORDER BY lease_expires_at LIMIT :batch FOR UPDATE SKIP LOCKED) RETURNING id`. M1's `tasks_pending_has_no_owner_check` requires a `PENDING` row to have a null `claimed_at`, so the reaper must clear `claimed_at` as well as `worker_id` and `lease_expires_at`.
 - Make sure every completion/failure/extension carries `attempt` in the `WHERE` clause (the fencing guard), so a stale worker's write affects 0 rows.
 - Worker handles "0 rows updated" as `LeaseLostException`: log, discard the result, and do not retry the write.
 - Record each reclaim in a `task_attempts` row (see below).
@@ -881,7 +874,7 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 - `engine.role=api|worker|all` implemented via conditional beans/properties.
 - `docker-compose.yml`: postgres, api, 2 workers, ui, prometheus, grafana. `docker-compose.dev.yml` for local DB only.
 - `server.shutdown=graceful` with a timeout; align with the worker shutdown timeout.
-- GitHub Actions: build + test, image build, push to GHCR on tags, run the UI tests.
+- GitHub Actions: the verify workflow already exists (M0). This milestone adds image build, push to GHCR on tags, and the UI tests.
 - Deploy compose to a single cloud VM (EC2/Lightsail or equivalent) with a managed or containerized Postgres, HTTPS via Caddy/nginx. Terraform for that VM is a stretch.
 - Secrets via environment variables; no secrets in the repo.
 
@@ -920,7 +913,7 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 
 ## 5. Recommended milestone order
 
-M0 → M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8 → M9 → M10 → M11 → M12 → M14 → M13 → M15 → M16
+M0 → M1 (includes former M2) → M3 → M4 → M5 → M6 → M7 → M8 → M9 → M10 → M11 → M12 → M14 → M13 → M15 → M16
 
 Reasoning for the small swap: doing load/chaos testing (M14) before the frontend (M13) means the UI is built against a hardened API, and the chaos results come while the engine design is still fresh. If you prefer visible progress earlier, do M13 first; they are independent.
 
@@ -1026,7 +1019,7 @@ durable-workflow-engine/
 │   ├── api/                     (controllers, DTOs, error handling, auth filter)
 │   ├── tenant/                  (tenants, api keys, limits, context)
 │   ├── task/                    (Task, TaskStatus, TaskRepository, TaskService, retry policy)
-│   ├── worker/                  (WorkerPool, heartbeat, handler registry, LeaseReaper)
+│   ├── worker/                  (WorkerPool, heartbeat, handlers, LeaseReaper)
 │   ├── workflow/
 │   │   ├── definition/          (model, validation, repository)
 │   │   ├── run/                 (run service, repository, events)
