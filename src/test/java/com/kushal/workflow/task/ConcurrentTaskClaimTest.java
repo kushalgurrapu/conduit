@@ -35,11 +35,11 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  * its own database transaction and connection.
  *
  * <p>The race this is aimed at: without row locking, two transactions can both
- * read the same PENDING id and both return it. The update matches that id
- * rather than re-checking status, so the second commit overwrites worker_id.
- * A sequential test misses that race. The first claim commits RUNNING before
- * the second claim starts, so the second claim no longer sees the row, and
- * both the locked and unlocked SQL pass.
+ * read the same PENDING id and both return it. The update matches that id and
+ * requires the row to still be PENDING, so a second claim that waits and then
+ * sees RUNNING does not take it. A sequential test misses the overlap. The
+ * first claim commits RUNNING before the second claim starts, so the second
+ * claim no longer sees the row, and both the locked and unlocked SQL pass.
  *
  * <p>What a passing run asserts: every successful claim has a distinct task id,
  * the number of successful claims matches the number of tasks, empty claims
@@ -53,7 +53,10 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  * but one unlucky run can still pass if the transactions never overlap.
  */
 @SpringBootTest
-@TestPropertySource(properties = "spring.datasource.hikari.maximum-pool-size=30")
+@TestPropertySource(properties = {
+        "spring.datasource.hikari.maximum-pool-size=30",
+        "spring.datasource.hikari.minimum-idle=30"
+})
 class ConcurrentTaskClaimTest extends PostgresIntegrationTest {
 
     private static final int TASK_COUNT = 20;
@@ -86,7 +89,7 @@ class ConcurrentTaskClaimTest extends PostgresIntegrationTest {
         ExecutorService executor = Executors.newFixedThreadPool(workerCount);
         try {
             for (int i = 0; i < taskCount; i++) {
-                createdIds.add(taskService.createTask("{\"test\":\"concurrent-claim\"}"));
+                createdIds.add(taskService.createTask("NOOP", "{\"test\":\"concurrent-claim\"}").id());
             }
 
             CyclicBarrier start = new CyclicBarrier(workerCount);
@@ -127,7 +130,7 @@ class ConcurrentTaskClaimTest extends PostgresIntegrationTest {
                         .filter(stored -> stored.id().equals(task.id()))
                         .findFirst()
                         .orElseThrow();
-                assertEquals("RUNNING", row.status(), "round " + round + ": status for " + task.id());
+                assertEquals(TaskStatus.RUNNING, row.status(), "round " + round + ": status for " + task.id());
                 assertNotNull(row.claimedAt(), "round " + round + ": claimed_at for " + task.id());
                 assertEquals(task.workerId(), row.workerId(), "round " + round + ": worker_id for " + task.id());
             }
@@ -160,7 +163,7 @@ class ConcurrentTaskClaimTest extends PostgresIntegrationTest {
                     .param("id", id)
                     .query((rs, rowNum) -> new StoredTask(
                             rs.getObject("id", UUID.class),
-                            rs.getString("status"),
+                            TaskStatus.valueOf(rs.getString("status")),
                             toInstant(rs.getObject("claimed_at", OffsetDateTime.class)),
                             rs.getObject("worker_id", UUID.class)
                     ))
@@ -177,7 +180,7 @@ class ConcurrentTaskClaimTest extends PostgresIntegrationTest {
         }
     }
 
-    private record StoredTask(UUID id, String status, Instant claimedAt, UUID workerId) {
+    private record StoredTask(UUID id, TaskStatus status, Instant claimedAt, UUID workerId) {
     }
 
     private static Instant toInstant(OffsetDateTime value) {

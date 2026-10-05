@@ -14,19 +14,15 @@ public class TaskService {
         this.taskRepository = taskRepository;
     }
 
-    public UUID createTask(String payload) {
-        UUID id = UUID.randomUUID();
-
-        taskRepository.createTask(
-                id,
-                "PENDING",
-                payload
-        );
-        return id;
+    public Task createTask(String taskType, String payload) {
+        return taskRepository.createTask(UUID.randomUUID(), taskType, payload);
     }
-    
+
     @Transactional
     public Task claimTask(UUID workerId) {
+        if (workerId == null) {
+            throw new IllegalArgumentException("workerId is required");
+        }
         return taskRepository.claimTask(workerId);
     }
 }

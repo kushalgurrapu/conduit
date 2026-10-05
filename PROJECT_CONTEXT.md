@@ -52,15 +52,22 @@ The database CHECK constraint also allows CANCELLED, but nothing sets it.
 
 Current implementation:
 
-- POST /tasks creates a task
+- POST /tasks creates a task. The body is the payload. The task type is
+  stored as NOOP until the versioned API accepts a type
 - POST /tasks/claim is a temporary test endpoint that claims with a random worker id
 - TaskRepository uses JdbcClient
 - TaskService owns transaction boundaries
 - Task claiming uses FOR UPDATE SKIP LOCKED
-- Claim records worker_id and claimed_at
+- The claim update re-checks status PENDING, and sets worker_id, claimed_at,
+  and updated_at (claimed_at and updated_at share the same now())
+- A null worker id is rejected before the claim write
 - Claim returns the updated Task
-- Schema is managed by Flyway V1-V3: timestamptz columns, updated_at,
-  a CHECK constraint on status, and a partial index on pending tasks
+- Task.status is a TaskStatus enum. isTerminal() is the only method.
+  Transitions are not decided in Java
+- Schema is managed by Flyway V1-V4: timestamptz columns, task_type, result,
+  error, finished_at, updated_at, a CHECK constraint on status, named checks
+  for task_type format, finished_at, and owner fields, and a partial index
+  on pending tasks
 - Datasource is configured with DB_URL, DB_USERNAME and DB_PASSWORD;
   defaults match the PostgreSQL in docker-compose.yml
 
@@ -75,7 +82,7 @@ Verified:
 - Flyway migrations apply to a fresh database
 - A task can be successfully claimed
 - Claimed task changes from PENDING → RUNNING
-- claimed_at and worker_id are populated
+- claimed_at, updated_at, and worker_id are populated on claim
 - Concurrent workers do not claim the same task (ConcurrentTaskClaimTest)
 - A task locked by another transaction is skipped, not waited on (SkipLockedClaimTest)
 - All integration tests share one Testcontainers PostgreSQL instance and
@@ -88,8 +95,9 @@ See PROJECT_ROADMAP.md.
 
 M1 is the current milestone: task lifecycle, the REST API, and the worker
 runtime. Roadmap M2 is merged into M1. Those decisions are recorded in
-ADR 0004 and in the roadmap deviations table. None of that behavior is
-implemented yet.
+ADR 0004 and in the roadmap deviations table. M1.1 is implemented: the
+task record, TaskStatus, and Flyway V4. Complete, fail, cancel, and the
+worker runtime are not.
 
 After M1:
 
