@@ -64,9 +64,10 @@ Current implementation:
 - Datasource is configured with DB_URL, DB_USERNAME and DB_PASSWORD;
   defaults match the PostgreSQL in docker-compose.yml
 
-Not implemented yet: attempt counter, leases, heartbeats, worker loop,
-crash recovery, fencing, retries, idempotency, workflow definitions, CI.
-TaskWorker is a placeholder.
+Not implemented yet: complete, fail, and cancel; attempt counter, leases,
+heartbeats, worker loop, crash recovery, fencing, retries, idempotency,
+and workflow definitions. TaskWorker is a placeholder that prints a line.
+GitHub Actions runs `./mvnw verify`.
 
 Verified:
 
@@ -82,15 +83,16 @@ Verified:
 
 Current milestone:
 
-M0 (foundation hardening) is in progress. See PROJECT_ROADMAP.md.
+M0 (foundation hardening) is complete, including GitHub Actions CI.
+See PROJECT_ROADMAP.md.
 
-Remaining in M0: a GitHub Actions workflow that runs the build and tests.
+M1 is the current milestone: task lifecycle, the REST API, and the worker
+runtime. Roadmap M2 is merged into M1. Those decisions are recorded in
+ADR 0004 and in the roadmap deviations table. None of that behavior is
+implemented yet.
 
-Next milestone: M1, the task lifecycle (complete/fail, validated API, error handling).
+After M1:
 
-After that:
-
-- worker loop
 - leases
 - crash recovery
 - fencing
@@ -100,8 +102,9 @@ After that:
 - scheduling/fairness
 - observability
 
-Design decisions are recorded in docs/adr/. ADRs 0002 (at-least-once) and
-0003 (fencing via attempt) describe planned behavior, not current code.
+Design decisions are recorded in docs/adr/. ADRs 0002 (at-least-once),
+0003 (fencing via attempt), and 0004 (lifecycle and execution) describe
+planned behavior, not current code.
 
 
 

@@ -53,6 +53,7 @@ introduced when it solves a real problem in the current milestone.
 -   REST/HTTP
 -   JUnit 5
 -   Testcontainers (PostgreSQL 16)
+-   GitHub Actions (`.github/workflows/ci.yml` runs `./mvnw verify`)
 
 ### Planned
 
@@ -61,7 +62,6 @@ introduced when it solves a real problem in the current milestone.
 -   Docker Compose for the full stack (application, workers, observability)
 -   OpenTelemetry
 -   Prometheus/Grafana
--   GitHub Actions
 
 Technologies such as Kafka, Kubernetes, Terraform, and cloud
 infrastructure are intentionally deferred until there is a concrete
@@ -176,9 +176,11 @@ RUNNING
    +------> FAILED
 ```
 
-The schema also allows `CANCELLED`, but nothing sets it yet. Further
-states may be introduced later if they are justified by the workflow
-requirements.
+The schema also allows `CANCELLED`, but nothing sets it yet. The planned
+M1 lifecycle (complete, fail, cancel, and a worker loop) is recorded in
+[ADR 0004](docs/adr/0004-task-lifecycle-and-execution-model.md). It is not
+built. Further states may be introduced later if they are justified by
+the workflow requirements.
 
 ## Database
 
@@ -322,13 +324,13 @@ worker_id  = <worker UUID>
 
 ## Current Milestone
 
-**M0 --- Foundation hardening** (in progress). See `PROJECT_ROADMAP.md`.
+**M0 --- Foundation hardening** is complete. See `PROJECT_ROADMAP.md`.
 
 The basic task-claiming mechanism is complete, and its concurrency
-behavior has been verified by tests. M0 makes that base reproducible and
+behavior has been verified by tests. M0 made that base reproducible and
 trustworthy before new behavior is added.
 
-Done in M0 so far:
+Done in M0:
 
 -   package renamed to `com.kushal.workflow`
 -   `V3__task_hardening.sql` (`timestamptz`, `updated_at`, status
@@ -340,25 +342,17 @@ Done in M0 so far:
 -   `.gitattributes` line-ending normalization
 -   Maven project name and description
 -   this documentation and the first architecture decision records
+-   a GitHub Actions workflow that runs `./mvnw verify`
 
-Still open in M0: a GitHub Actions workflow that runs `./mvnw verify`.
-There is no CI yet.
+**M1 --- task lifecycle, API, and worker runtime** is the current
+milestone. Roadmap M2 is merged into M1. The decisions are recorded in
+ADR 0004 and in the roadmap's deviations table. None of that behavior is
+implemented yet: there is still no complete, fail, or cancel operation,
+and `TaskWorker` still only prints a line.
 
-The next milestone is M1, the task lifecycle: complete and fail
-operations, a validated REST API, and error handling. After that, the
-project will turn the claim operation into a worker loop and move toward:
-
-``` text
-Worker
-  |
-  +--> claim task
-  |
-  +--> execute task
-  |
-  +--> complete/fail task
-```
-
-Then we will introduce leases and failure recovery.
+The intended shape, once M1 is built, is three short steps: claim in a
+transaction, execute the handler with no transaction, then one complete
+or fail. Leases and failure recovery stay in later milestones.
 
 ## Planned Development Order
 
@@ -378,6 +372,7 @@ The project should progress roughly in this order:
 -   [x] Verify a task can be claimed
 -   [x] Concurrent worker test
 -   [x] Deterministic `SKIP LOCKED` test
+-   [x] GitHub Actions workflow that runs `./mvnw verify`
 
 ### Phase 2 --- Workers
 
@@ -508,9 +503,10 @@ Key design decisions are recorded in `docs/adr/`:
 -   [0001 --- PostgreSQL as the task store and queue](docs/adr/0001-postgres-as-queue.md)
 -   [0002 --- At-least-once execution](docs/adr/0002-at-least-once.md)
 -   [0003 --- Fencing via the attempt counter](docs/adr/0003-fencing-via-attempt.md)
+-   [0004 --- Task lifecycle and execution model](docs/adr/0004-task-lifecycle-and-execution-model.md)
 
-ADRs 0002 and 0003 describe planned behavior for later milestones, not
-what the code does today. Each one says so explicitly.
+ADRs 0002, 0003, and 0004 describe planned behavior, not what the code
+does today. Each one says so explicitly.
 
 ## Repository Structure
 
@@ -523,6 +519,7 @@ durable-workflow-engine/
 ├── PROJECT_ROADMAP.md
 ├── docker-compose.yml
 ├── pom.xml
+├── .github/workflows/ci.yml
 ├── docs/
 │   └── adr/
 └── src/
@@ -542,14 +539,15 @@ created all at once.
 
 ## Current Status
 
-**Milestone: M0 --- Foundation hardening (in progress)**
+**Milestone: M0 complete. M1 (lifecycle, API, and worker runtime) is next, and not built yet.**
 
 The system can currently create a task, store it in PostgreSQL, safely
 claim a pending task using PostgreSQL row locking, and return the
 resulting task. Concurrent claiming is covered by integration tests that
-run against Testcontainers.
+run against Testcontainers. GitHub Actions runs `./mvnw verify`.
 
-Not built yet: completing or failing a task, a worker loop, attempts,
-leases, heartbeats, recovery of abandoned tasks, fencing, retries,
-idempotency, and CI. A worker that dies after claiming a task leaves it
-in `RUNNING` forever. These are the subject of later milestones.
+Not built yet: completing, failing, or cancelling a task, a worker loop,
+attempts, leases, heartbeats, recovery of abandoned tasks, fencing,
+retries, and idempotency. A worker that dies after claiming a task leaves
+it in `RUNNING` forever. ADR 0004 records how M1 will behave. It does not
+describe the code today.
