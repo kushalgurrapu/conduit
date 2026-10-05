@@ -108,7 +108,7 @@ worker itself calling the service layer.
 ### Service
 
 `TaskService` contains application-level logic and owns the transaction
-boundary for task claiming.
+boundary for claiming a task and for complete, fail, and cancel.
 
 The important distinction is:
 
@@ -132,6 +132,8 @@ It currently handles:
 
 -   inserting tasks
 -   atomically claiming pending tasks
+-   completing or failing a running task for its owning worker
+-   cancelling a pending task
 
 ## Task Model
 
@@ -153,40 +155,47 @@ worker_id   uuid, null while the task is pending
 
 `TaskStatus` is `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, or
 `CANCELLED`. `isTerminal()` is true for the last three. The enum does
-not decide which transition is legal. That stays in the SQL `WHERE`
-clause. The application currently only produces `PENDING` and `RUNNING`.
-
-A task begins in:
+not decide which transition is legal. Each write is one `UPDATE`, and
+its `WHERE` clause is the rule:
 
 ``` text
-PENDING
+claim    PENDING  -> RUNNING     for one worker
+complete RUNNING -> COMPLETED    only that worker
+fail     RUNNING -> FAILED       only that worker
+cancel   PENDING -> CANCELLED
 ```
 
-When a worker successfully claims it:
+A task begins as `PENDING`. Claim moves it to `RUNNING` and records the
+worker. Complete and fail then set `finished_at` and `updated_at`. Cancel
+does the same, and only while the task is still pending. If the `UPDATE`
+changes zero rows, the service reads the row once to name the outcome
+(already applied, already cancelled, or rejected). That read does not
+write again. The HTTP API does not expose complete, fail, or cancel yet.
+Nothing runs a handler, so a claimed task stays `RUNNING` until something
+calls the service.
 
-``` text
-RUNNING
+Calling complete again with a different result does not overwrite the
+first result. The second call is "already applied" when the same worker
+already reached that status.
+
+There is no engine path from `RUNNING` back to `PENDING`. An operator can
+requeue by hand, and only by pinning the worker they observed. That
+statement is not an API. It is safe for the engine's row. The handler may
+already have run, and it may run again:
+
+``` sql
+UPDATE tasks
+SET status = 'PENDING', worker_id = NULL, claimed_at = NULL,
+    updated_at = now()
+WHERE id = :id
+  AND status = 'RUNNING'
+  AND worker_id = :observedWorkerId;
 ```
 
-There is no complete or fail operation yet, so a claimed task stays
-`RUNNING`. The intended future lifecycle is:
-
-``` text
-PENDING
-   |
-   v
-RUNNING
-   |
-   +------> COMPLETED
-   |
-   +------> FAILED
-```
-
-The schema also allows `CANCELLED`, but nothing sets it yet. The planned
-M1 lifecycle (complete, fail, cancel, and a worker loop) is recorded in
-[ADR 0004](docs/adr/0004-task-lifecycle-and-execution-model.md). It is not
-built. Further states may be introduced later if they are justified by
-the workflow requirements.
+The rest of the M1 model (a worker loop, and the versioned API) is
+recorded in [ADR 0004](docs/adr/0004-task-lifecycle-and-execution-model.md).
+It is not built yet. Further states may be introduced later if they are
+justified by the workflow requirements.
 
 ## Database
 
@@ -307,6 +316,17 @@ This allows multiple workers to make progress concurrently.
     checks that `updated_at` moved to the same instant as `claimed_at`.
     It also checks that a null worker id is rejected and the row stays
     `PENDING`.
+-   `GuardedTransitionTest` tries complete, fail, and cancel from every
+    status. An applied write moves `updated_at` and `finished_at`. A
+    rejected write leaves the row unchanged. A second complete with a
+    different result is already applied. The documented requeue, pinned
+    to the observed worker, lets a new worker finish and rejects the old
+    one.
+-   `TransitionLockHoldTest` holds an uncommitted claim. Cancel waits
+    (`pg_blocking_pids`), then is rejected if that claim commits and
+    applies if it rolls back. A second claim returns nothing while the
+    first claim is still open, and the committed worker is still the
+    first one.
 
 All of the Spring tests extend `PostgresIntegrationTest`, which uses one
 shared Testcontainers PostgreSQL container, deletes every task before
@@ -328,7 +348,13 @@ The current implementation has successfully demonstrated:
 -   a claimed task changes from `PENDING` to `RUNNING`
 -   `claimed_at` and `updated_at` are set to the same timestamp
 -   `worker_id` is populated
--   a null worker id does not claim the task
+-   a null worker id does not claim, complete, or fail the task
+-   complete and fail apply only for the owning worker, and they set
+    `finished_at` and `updated_at` together
+-   a second complete by that worker does not change the stored result
+-   cancel applies only to a pending task, and cancelling twice does not
+    write the row again
+-   a cancel that loses the race to a committed claim does not apply
 -   V4 applies to a fresh database and to a V3 database with a V1-shaped
     pending row
 -   the updated task is returned to the caller
@@ -384,9 +410,11 @@ Done in M0:
 milestone. Roadmap M2 is merged into M1. The decisions are recorded in
 ADR 0004 and in the roadmap's deviations table.
 
-M1.1 is in place: `TaskStatus`, the wider `Task` record, and `V4`. There
-is still no complete, fail, or cancel operation, and `TaskWorker` still
-only prints a line.
+M1.1 is in place: `TaskStatus`, the wider `Task` record, and `V4`.
+M1.2 is in place: complete, fail, and cancel are guarded updates, and
+the service classifies a zero-row write instead of retrying it.
+`TaskWorker` still only prints a line, and the HTTP API still cannot
+finish or cancel a task.
 
 The intended shape, once M1 is built, is three short steps: claim in a
 transaction, execute the handler with no transaction, then one complete
@@ -577,15 +605,18 @@ created all at once.
 
 ## Current Status
 
-**Milestone: M0 complete. M1 (lifecycle, API, and worker runtime) is next, and not built yet.**
+**Milestone: M0 complete. M1.1 and M1.2 are in place. The worker runtime and the versioned API are not.**
 
 The system can currently create a task, store it in PostgreSQL, safely
-claim a pending task using PostgreSQL row locking, and return the
-resulting task. Concurrent claiming is covered by integration tests that
-run against Testcontainers. GitHub Actions runs `./mvnw verify`.
+claim a pending task using PostgreSQL row locking, and complete, fail, or
+cancel that task through the service. The `WHERE` clause of each update
+is the lifecycle rule. Concurrent claiming and the cancel-versus-claim
+race are covered by integration tests that run against Testcontainers.
+GitHub Actions runs `./mvnw verify`.
 
-Not built yet: completing, failing, or cancelling a task, a worker loop,
-attempts, leases, heartbeats, recovery of abandoned tasks, fencing,
-retries, and idempotency. A worker that dies after claiming a task leaves
-it in `RUNNING` forever. ADR 0004 records how M1 will behave. It does not
-describe the code today.
+Not built yet: a worker loop, the versioned REST API, attempts, leases,
+heartbeats, recovery of abandoned tasks, fencing, retries, and
+idempotency. A worker that dies after claiming a task leaves it in
+`RUNNING` until something calls complete or fail. ADR 0004 records the
+rest of the M1 model. The finish guards in that ADR match the code. The
+handler and pool parts do not.

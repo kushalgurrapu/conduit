@@ -4,9 +4,9 @@
 
 Accepted
 
-This is the M1 decision. The schema, the `Task` record, and the claim
-write described here are implemented. Complete, fail, cancel, the worker
-runtime, and the versioned REST API are not. See "Current implementation
+This is the M1 decision. The schema, the `Task` record, claim, and the
+guarded complete, fail, and cancel writes are implemented. The worker
+runtime and the versioned REST API are not. See "Current implementation
 versus planned".
 
 Roadmap M2 (the worker runtime) is merged into M1. Leases, recovery, and
@@ -211,8 +211,10 @@ and the engine does not yet defend against it.
 
 ### Guarantees M1 will make, and will not make
 
-These are the claims M1 may make once the tests exist. They are not
-claims about the repository today.
+These are the claims M1 may make once the tests exist. The finish guards
+are implemented: one applied complete or fail per claim, only from the
+owning `worker_id`, and cancel only from `PENDING`. The items that need
+a handler or a worker pool are not claims about the code today.
 
 M1 provides:
 
@@ -268,25 +270,43 @@ invocations.
   `updated_at = now()` along with `worker_id` and `claimed_at`, and
   returns the mapped columns (not `RETURNING *`). A null `workerId` is
   rejected before that write. The row becomes `RUNNING`.
+- Complete and fail (`TaskService.completeTask` / `failTask`): one
+  `UPDATE ... RETURNING` whose `WHERE` is `id`, `status = 'RUNNING'`, and
+  `worker_id`. The statement sets `finished_at` and `updated_at`. Fail
+  strips NUL bytes in Java and stores `left(error, 4000)`. A null
+  `workerId` is rejected before the write. Zero rows is not an exception
+  and is not retried. The same transaction re-reads the row only to
+  classify it: `Applied`, `AlreadyApplied` (same worker and same target
+  status), or `Rejected`. A second complete with a different result leaves
+  the first result and the timestamps unchanged.
+- Cancel (`TaskService.cancelTask`): one update whose `WHERE` is `id` and
+  `status = 'PENDING'`. `Cancelled`, `AlreadyCancelled`, and
+  `NotCancellable` are values. A missing id is `TaskNotFoundException`.
+  There is no HTTP mapping yet.
+- The manual requeue in this ADR is not a repository method. A test runs
+  that statement, then shows the old worker's complete is rejected and
+  the new worker's complete applies.
 - `V4` adds `task_type`, `result`, `error`, and `finished_at`, backfills
   existing rows, and adds the named checks: `tasks_task_type_format_check`,
   `tasks_finished_at_iff_terminal_check`, `tasks_running_has_owner_check`,
   and `tasks_pending_has_no_owner_check`. `tasks_status_check` remains.
 - Concurrent claim tests: a task is not claimed twice, and a locked row is
-  skipped rather than waited on.
+  skipped rather than waited on. `TransitionLockHoldTest` holds an
+  uncommitted claim: cancel waits, then loses if the claim commits and
+  applies if it rolls back. A second claim returns empty, and the
+  committed worker is the first one.
 
 **Not implemented:**
 
-- Complete, fail, and cancel, including the `WHERE` guards.
 - A worker loop, handlers, and graceful shutdown. `TaskWorker` prints a
   line.
-- The versioned REST API. There is no GET, no cancel, and no
-  `ProblemDetail` error model.
+- The versioned REST API. There is no GET, no cancel endpoint, and no
+  `ProblemDetail` error model. Complete and fail are not HTTP operations.
 
-The named checks hold. The execution guarantees above do not: there is
-still no finish write. A crash after claim leaves the task `RUNNING`
-with no further progress. That is a lost task, not at-least-once
-execution (ADR 0002).
+The named checks hold. The finish guards hold. The execution guarantees
+that depend on a handler still do not: there is no worker loop. A crash
+after claim leaves the task `RUNNING` with no further progress. That is a
+lost task, not at-least-once execution (ADR 0002).
 
 ## Consequences
 

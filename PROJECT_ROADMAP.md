@@ -4,7 +4,9 @@ This roadmap was written on 2026-10-02 from a read of the repo at that time: `po
 
 **How agents should use this file:** implement ONE milestone at a time (M0, M1, ...). Re-inspect the repository first, since it is the source of truth and may have moved past section 0. Follow the milestone's "Definition of done" and the architecture decisions in section 1, and respect the "do NOT build" list in section 2. Follow the AI Development Rule in `PROJECT_CONTEXT.md` (explain architectural changes before making them).
 
-**Update (M1.0, 2026-10-05):** M0 is complete, including GitHub Actions (`.github/workflows/ci.yml` runs `./mvnw verify` with a 20-minute job timeout). Roadmap M2 is merged into M1. Deviations from the original M1-M4 text are in the table under M1, and the lifecycle model is ADR 0004. That behavior is not implemented. Section 0 below is the 2026-10-02 audit, not the current tree.
+**Update (M1.0, 2026-10-05):** M0 is complete, including GitHub Actions (`.github/workflows/ci.yml` runs `./mvnw verify` with a 20-minute job timeout). Roadmap M2 is merged into M1. Deviations from the original M1-M4 text are in the table under M1, and the lifecycle model is ADR 0004. Section 0 below is the 2026-10-02 audit, not the current tree.
+
+**Update (M1.2, 2026-10-05):** M1.1 (`TaskStatus`, `Task`, Flyway V4) and M1.2 (guarded complete, fail, and cancel) are implemented. The worker runtime and the versioned API are not.
 
 ---
 
