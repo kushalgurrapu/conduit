@@ -1,14 +1,29 @@
 package com.kushal.workflow.support;
 
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
-import org.testcontainers.containers.PostgreSQLContainer;
+import org.junit.jupiter.api.BeforeEach;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.test.context.TestPropertySource;
 
-public abstract class PostgresIntegrationTest {
+/**
+ * Spring tests share {@link PostgresContainerSupport}'s container.
+ *
+ * <p>{@code engine.worker.enabled=false} keeps a future worker pool from
+ * claiming rows while a test is looking at them. {@code DELETE FROM tasks}
+ * drops rows from earlier tests without taking the stronger locks of
+ * {@code TRUNCATE}.
+ */
+@TestPropertySource(properties = {
+        "engine.worker.enabled=false",
+        "spring.datasource.hikari.minimum-idle=1"
+})
+public abstract class PostgresIntegrationTest extends PostgresContainerSupport {
 
-    @ServiceConnection
-    static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+    @Autowired
+    private JdbcClient jdbcClient;
 
-    static {
-        postgres.start();
+    @BeforeEach
+    void deleteAllTasks() {
+        jdbcClient.sql("DELETE FROM tasks").update();
     }
 }

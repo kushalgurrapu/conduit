@@ -98,7 +98,8 @@ POST /tasks
 POST /tasks/claim
 ```
 
-`POST /tasks` creates a new task.
+`POST /tasks` creates a new task. The body is the JSON payload. The task
+type is stored as `NOOP` until the versioned API accepts a type.
 
 `POST /tasks/claim` is currently a temporary testing endpoint used to
 exercise the task-claiming logic. It will eventually be replaced by the
@@ -138,17 +139,22 @@ Tasks currently have the following fields:
 
 ``` text
 id          uuid
-status      text, limited by a CHECK constraint (see below)
-payload     jsonb
+task_type   text, format-checked (for example NOOP)
+status      TaskStatus in Java, text in the database
+payload     jsonb, read back as text
+result      jsonb, null until a task completes
+error       text, null until a task fails
 created_at  timestamptz
-claimed_at  timestamptz, NULL until the task is claimed
-updated_at  timestamptz
-worker_id   uuid, NULL until the task is claimed
+updated_at  timestamptz, set again on every write
+claimed_at  timestamptz, null while the task is pending
+finished_at timestamptz, set only when the task is terminal
+worker_id   uuid, null while the task is pending
 ```
 
-The database only accepts these statuses: `PENDING`, `RUNNING`,
-`COMPLETED`, `FAILED`, and `CANCELLED`. The application currently only
-produces `PENDING` and `RUNNING`.
+`TaskStatus` is `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, or
+`CANCELLED`. `isTerminal()` is true for the last three. The enum does
+not decide which transition is legal. That stays in the SQL `WHERE`
+clause. The application currently only produces `PENDING` and `RUNNING`.
 
 A task begins in:
 
@@ -196,6 +202,16 @@ Flyway migrations in `src/main/resources/db/migration` build the schema:
 -   `V3` converts `created_at` and `claimed_at` to `timestamptz`, adds
     `updated_at`, adds the `CHECK` constraint on `status`, and adds the
     partial index `idx_tasks_pending` on `created_at` for pending rows.
+-   `V4` adds `task_type`, `result`, `error`, and `finished_at`. Existing
+    rows become `task_type = 'NOOP'`, then that default is dropped. Pending
+    rows that still have `claimed_at` or `worker_id` (possible after V1)
+    have those cleared. Terminal rows get `finished_at`. Named checks then
+    require: `task_type` matches `^[A-Z][A-Z0-9_]{0,63}$`; `finished_at` is
+    set exactly when the status is terminal; `RUNNING` has an owner;
+    `PENDING` has none. A `RUNNING` row with no owner is not repaired, so
+    the migration fails. If a local Compose database was edited into that
+    shape, `docker compose down -v` drops it. Those `NOOP` rows will
+    complete as no-ops once workers exist.
 
 The datasource is read from `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`.
 The defaults match the Compose database, so the application runs without
@@ -239,8 +255,12 @@ The claim operation then changes the selected task to:
 ``` text
 status     = RUNNING
 claimed_at = current timestamp
+updated_at = current timestamp (same now() as claimed_at)
 worker_id  = claiming worker
 ```
+
+The update also requires the row to still be `PENDING`. A null
+`workerId` is rejected in Java before that write.
 
 The repository uses PostgreSQL's `RETURNING` capability to return the
 updated task.
@@ -279,9 +299,21 @@ This allows multiple workers to make progress concurrently.
     because of a short `statement_timeout`.
 -   `DurableWorkflowEngineApplicationTests` checks that the application
     context starts and the migrations apply to a fresh database.
+-   `V4MigrationTest` migrates a second database only as far as V3, inserts
+    a pending row that still has `claimed_at`, a running row with an owner,
+    and a completed row with no `finished_at`, then migrates to V4 and
+    checks the backfill and the constraint names.
+-   `ClaimUpdatedAtTest` backdates `updated_at`, claims the task, and
+    checks that `updated_at` moved to the same instant as `claimed_at`.
+    It also checks that a null worker id is rejected and the row stays
+    `PENDING`.
 
-All of them extend `PostgresIntegrationTest`, which provides one shared
-Testcontainers PostgreSQL container.
+All of the Spring tests extend `PostgresIntegrationTest`, which uses one
+shared Testcontainers PostgreSQL container, deletes every task before
+each test, and leaves workers disabled. The container turns `fsync` off
+and sets short lock timeouts so the suite does not hang. That container
+is not evidence that a crash is durable. `V4MigrationTest` uses the same
+server and its own database, so it does not start the Spring context.
 
 ## Verified So Far
 
@@ -294,8 +326,11 @@ The current implementation has successfully demonstrated:
 -   the application can communicate with PostgreSQL
 -   a pending task can be claimed
 -   a claimed task changes from `PENDING` to `RUNNING`
--   `claimed_at` is populated
+-   `claimed_at` and `updated_at` are set to the same timestamp
 -   `worker_id` is populated
+-   a null worker id does not claim the task
+-   V4 applies to a fresh database and to a V3 database with a V1-shaped
+    pending row
 -   the updated task is returned to the caller
 -   concurrent workers never claim the same task twice
     (`ConcurrentTaskClaimTest`)
@@ -319,6 +354,7 @@ After:
 
 status     = RUNNING
 claimed_at = <timestamp>
+updated_at = <same timestamp>
 worker_id  = <worker UUID>
 ```
 
@@ -346,9 +382,11 @@ Done in M0:
 
 **M1 --- task lifecycle, API, and worker runtime** is the current
 milestone. Roadmap M2 is merged into M1. The decisions are recorded in
-ADR 0004 and in the roadmap's deviations table. None of that behavior is
-implemented yet: there is still no complete, fail, or cancel operation,
-and `TaskWorker` still only prints a line.
+ADR 0004 and in the roadmap's deviations table.
+
+M1.1 is in place: `TaskStatus`, the wider `Task` record, and `V4`. There
+is still no complete, fail, or cancel operation, and `TaskWorker` still
+only prints a line.
 
 The intended shape, once M1 is built, is three short steps: claim in a
 transaction, execute the handler with no transaction, then one complete

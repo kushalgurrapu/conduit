@@ -65,8 +65,8 @@ class SkipLockedClaimTest extends PostgresIntegrationTest {
     @Test
     @Timeout(value = 15, unit = TimeUnit.SECONDS)
     void claimSkipsLockedOlderTask() throws Exception {
-        UUID olderId = taskService.createTask("{\"test\":\"skip-locked-older\"}");
-        UUID newerId = taskService.createTask("{\"test\":\"skip-locked-newer\"}");
+        UUID olderId = taskService.createTask("NOOP", "{\"test\":\"skip-locked-older\"}").id();
+        UUID newerId = taskService.createTask("NOOP", "{\"test\":\"skip-locked-newer\"}").id();
         List<UUID> createdIds = List.of(olderId, newerId);
         setCreatedAt(olderId, OffsetDateTime.parse("2020-01-01T00:00:00Z"));
         setCreatedAt(newerId, OffsetDateTime.parse("2020-01-01T00:00:01Z"));
@@ -82,7 +82,7 @@ class SkipLockedClaimTest extends PostgresIntegrationTest {
 
             assertNotNull(claimed, "claim should skip the locked row and return the next pending task");
             assertEquals(newerId, claimed.id());
-            assertEquals("RUNNING", claimed.status());
+            assertEquals(TaskStatus.RUNNING, claimed.status());
             assertEquals(workerId, claimed.workerId());
             assertEquals("PENDING", statusOf(olderId));
         } finally {
@@ -99,7 +99,7 @@ class SkipLockedClaimTest extends PostgresIntegrationTest {
     @Test
     @Timeout(value = 15, unit = TimeUnit.SECONDS)
     void claimReturnsNullWhenPendingTasksAreLocked() throws Exception {
-        UUID onlyId = taskService.createTask("{\"test\":\"skip-locked-only\"}");
+        UUID onlyId = taskService.createTask("NOOP", "{\"test\":\"skip-locked-only\"}").id();
         List<UUID> createdIds = List.of(onlyId);
 
         Connection lock = dataSource.getConnection();

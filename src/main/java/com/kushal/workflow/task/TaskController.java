@@ -15,7 +15,9 @@ public class TaskController {
 
     @PostMapping
     public UUID createTask(@RequestBody String payload) {
-        return taskService.createTask(payload);
+        // M1.5 accepts a task type. Until then this endpoint stores NOOP, the
+        // same type V4 assigns to rows that already existed.
+        return taskService.createTask("NOOP", payload).id();
     }
 
     @PostMapping(value = "/claim", consumes = {})

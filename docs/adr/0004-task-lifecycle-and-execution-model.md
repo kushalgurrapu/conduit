@@ -4,9 +4,10 @@
 
 Accepted
 
-This is a **planned** decision for M1. The lifecycle, worker runtime, and
-REST API described here are **not implemented**. See "Current
-implementation versus planned".
+This is the M1 decision. The schema, the `Task` record, and the claim
+write described here are implemented. Complete, fail, cancel, the worker
+runtime, and the versioned REST API are not. See "Current implementation
+versus planned".
 
 Roadmap M2 (the worker runtime) is merged into M1. Leases, recovery, and
 retries stay in M3-M5. This is the only ADR for the M1 lifecycle and
@@ -85,8 +86,8 @@ apply (`409`). A missing id is not found.
 
 #### Terminal states are not absorbing at the `CHECK` layer
 
-`tasks_status_check` only limits which status strings exist. A planned
-`tasks_finished_at_iff_terminal_check` will require `finished_at` exactly
+`tasks_status_check` only limits which status strings exist.
+`tasks_finished_at_iff_terminal_check` requires `finished_at` exactly
 when the status is terminal. Neither constraint can see the previous row.
 An `UPDATE` that sets `status = 'PENDING'` and `finished_at = NULL` in the
 same statement satisfies both checks.
@@ -255,30 +256,37 @@ invocations.
 
 **Implemented today:**
 
-- Create a task (`POST /tasks`) in `PENDING`.
+- Create a task (`POST /tasks`) in `PENDING` with `task_type = 'NOOP'`.
+  The service method is `createTask(taskType, payload)` and returns the
+  inserted row. JSON columns are text at the repository boundary.
+- `TaskStatus` with `isTerminal()` only. `Task` carries `taskType`,
+  `status`, `payload`, `result`, `error`, `createdAt`, `updatedAt`,
+  `claimedAt`, `finishedAt`, and `workerId`.
 - Claim one `PENDING` row (`POST /tasks/claim` or `TaskService.claimTask`):
   `FOR UPDATE SKIP LOCKED`, then `UPDATE ... RETURNING`, inside one
-  transaction. The row becomes `RUNNING` with `worker_id` and `claimed_at`.
-- Status values are limited by `tasks_status_check` to `PENDING`,
-  `RUNNING`, `COMPLETED`, `FAILED`, and `CANCELLED`.
+  transaction. The outer update requires `status = 'PENDING'` again, sets
+  `updated_at = now()` along with `worker_id` and `claimed_at`, and
+  returns the mapped columns (not `RETURNING *`). A null `workerId` is
+  rejected before that write. The row becomes `RUNNING`.
+- `V4` adds `task_type`, `result`, `error`, and `finished_at`, backfills
+  existing rows, and adds the named checks: `tasks_task_type_format_check`,
+  `tasks_finished_at_iff_terminal_check`, `tasks_running_has_owner_check`,
+  and `tasks_pending_has_no_owner_check`. `tasks_status_check` remains.
 - Concurrent claim tests: a task is not claimed twice, and a locked row is
   skipped rather than waited on.
 
 **Not implemented:**
 
-- `task_type`, `result`, `error`, `finished_at`, and the named checks
-  above. There is no `V4`.
 - Complete, fail, and cancel, including the `WHERE` guards.
-- The claim `UPDATE` does not re-check `status = 'PENDING'`, and it does
-  not set `updated_at`.
 - A worker loop, handlers, and graceful shutdown. `TaskWorker` prints a
   line.
 - The versioned REST API. There is no GET, no cancel, and no
   `ProblemDetail` error model.
 
-None of the guarantees above hold yet. A crash after claim leaves the
-task `RUNNING` with no further progress. That is a lost task, not
-at-least-once execution (ADR 0002).
+The named checks hold. The execution guarantees above do not: there is
+still no finish write. A crash after claim leaves the task `RUNNING`
+with no further progress. That is a lost task, not at-least-once
+execution (ADR 0002).
 
 ## Consequences
 
