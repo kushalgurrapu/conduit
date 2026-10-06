@@ -4,10 +4,10 @@
 
 Accepted
 
-This is the M1 decision. The schema, the `Task` record, claim, and the
-guarded complete, fail, and cancel writes are implemented. The worker
-runtime and the versioned REST API are not. See "Current implementation
-versus planned".
+This is the M1 decision. The schema, the `Task` record, claim, the
+guarded complete, fail, and cancel writes, and `TaskExecutor` (claim,
+handler, one finish write) are implemented. The worker pool and the
+versioned REST API are not. See "Current implementation versus planned".
 
 Roadmap M2 (the worker runtime) is merged into M1. Leases, recovery, and
 retries stay in M3-M5. This is the only ADR for the M1 lifecycle and
@@ -213,8 +213,10 @@ and the engine does not yet defend against it.
 
 These are the claims M1 may make once the tests exist. The finish guards
 are implemented: one applied complete or fail per claim, only from the
-owning `worker_id`, and cancel only from `PENDING`. The items that need
-a handler or a worker pool are not claims about the code today.
+owning `worker_id`, and cancel only from `PENDING`. `TaskExecutorTest`
+covers no connection during execute, one finish attempt, and an
+interrupt left as `RUNNING`. The items that need a worker pool are not
+claims about the code today.
 
 M1 provides:
 
@@ -295,17 +297,40 @@ invocations.
   uncommitted claim: cancel waits, then loses if the claim commits and
   applies if it rolls back. A second claim returns empty, and the
   committed worker is the first one.
+- `TaskHandler`, `TaskContext`, and `TaskOutcome` (`Succeeded` /
+  `Failed`). `TaskExecutor.runOnce` is not transactional. It claims
+  through the `TaskService` proxy, runs the handler with no transaction
+  and no pooled connection, then makes one complete or fail call.
+  `NOOP`, `ECHO`, `FAIL`, and `SLEEP` are always registered. `SLEEP`
+  reads `millis` from the payload and caps it at 60 seconds; that cap
+  is not a handler timeout. Handlers are indexed in a
+  `Map<String, TaskHandler>` bean. Startup fails on a duplicate type or
+  a type that fails `^[A-Z][A-Z0-9_]{0,63}$`.
+- A missing handler, a thrown exception, or a null return is one fail
+  write (`no handler for type X`, the exception class and message, or
+  `handler returned null`). An `Error` propagates and the row stays
+  `RUNNING`. An interrupt during execute, including an
+  `InterruptedException` in the cause chain or the interrupt flag set
+  when the handler throws, restores the flag and leaves the row
+  `RUNNING`. A returned outcome, including `Failed`, still gets its one
+  finish write: the interrupt flag is cleared around that write and
+  then restored. `Applied` and `AlreadyApplied` are success. Anything
+  else is logged. If the finish write throws, it is logged, the row
+  stays `RUNNING`, and `runOnce` returns true. An empty queue returns
+  false. MDC holds `taskId`, `workerId`, and `taskType` for the cycle.
 
 **Not implemented:**
 
-- A worker loop, handlers, and graceful shutdown. `TaskWorker` prints a
-  line.
+- A worker loop and graceful shutdown. `TaskWorker` prints a line.
+  Nothing calls `runOnce` when the process starts.
 - The versioned REST API. There is no GET, no cancel endpoint, and no
   `ProblemDetail` error model. Complete and fail are not HTTP operations.
 
-The named checks hold. The finish guards hold. The execution guarantees
-that depend on a handler still do not: there is no worker loop. A crash
-after claim leaves the task `RUNNING` with no further progress. That is a
+The named checks hold. The finish guards hold. `TaskExecutorTest` covers
+one finish attempt, no connection during execute, and interruption left
+as `RUNNING`. There is still no worker loop, so the concurrency cap and
+the stop behavior are not claims about the code today. A crash after
+claim leaves the task `RUNNING` with no further progress. That is a
 lost task, not at-least-once execution (ADR 0002).
 
 ## Consequences

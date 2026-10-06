@@ -171,8 +171,6 @@ does the same, and only while the task is still pending. If the `UPDATE`
 changes zero rows, the service reads the row once to name the outcome
 (already applied, already cancelled, or rejected). That read does not
 write again. The HTTP API does not expose complete, fail, or cancel yet.
-Nothing runs a handler, so a claimed task stays `RUNNING` until something
-calls the service.
 
 Calling complete again with a different result does not overwrite the
 first result. The second call is "already applied" when the same worker
@@ -192,9 +190,31 @@ WHERE id = :id
   AND worker_id = :observedWorkerId;
 ```
 
-The rest of the M1 model (a worker loop, and the versioned API) is
-recorded in [ADR 0004](docs/adr/0004-task-lifecycle-and-execution-model.md).
-It is not built yet. Further states may be introduced later if they are
+`TaskExecutor.runOnce` is what runs one claimed task. Nothing calls it
+when the application starts. `TaskWorker` still only prints a line, and
+there is no background loop yet. A caller (today, a test) does three
+things:
+
+1.  Claim one pending task, in a transaction.
+2.  Run the handler for that `task_type` with no transaction and no
+    database connection.
+3.  Write the outcome once: complete, or fail. If that write throws, the
+    task stays `RUNNING`. There is no second attempt.
+
+Handlers are always registered: `NOOP` completes and stores JSON null,
+`ECHO` stores the payload as the result, `FAIL` fails (a textual
+`reason` field in the payload is the error, otherwise the error is
+`failed`), and `SLEEP` sleeps for the payload's `millis` (at most 60
+seconds) and then completes. An unknown type, a thrown exception, or a
+null return is one fail write. An interrupt while the handler is still
+running leaves the task `RUNNING` with the same worker. If the handler
+already returned, that outcome is still written once. Startup fails if
+two handlers use the same type, or if a type does not match the
+`task_type` check.
+
+The worker pool and the versioned API are recorded in
+[ADR 0004](docs/adr/0004-task-lifecycle-and-execution-model.md). They are
+not built yet. Further states may be introduced later if they are
 justified by the workflow requirements.
 
 ## Database
@@ -219,8 +239,10 @@ Flyway migrations in `src/main/resources/db/migration` build the schema:
     set exactly when the status is terminal; `RUNNING` has an owner;
     `PENDING` has none. A `RUNNING` row with no owner is not repaired, so
     the migration fails. If a local Compose database was edited into that
-    shape, `docker compose down -v` drops it. Those `NOOP` rows will
-    complete as no-ops once workers exist.
+    shape, `docker compose down -v` drops it. A `NOOP` row completes with
+    a JSON null result when `TaskExecutor.runOnce` claims it. Nothing
+    calls that method until the worker pool exists, so a pending row
+    stays pending.
 
 The datasource is read from `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`.
 The defaults match the Compose database, so the application runs without
@@ -327,6 +349,12 @@ This allows multiple workers to make progress concurrently.
     applies if it rolls back. A second claim returns nothing while the
     first claim is still open, and the committed worker is still the
     first one.
+-   `TaskExecutorTest` calls `runOnce` directly. Echo completes with the
+    payload as the result, a failed outcome and a thrown exception and
+    an unknown type each fail once, an empty queue returns false, the
+    handler runs with no transaction and no borrowed connection, an
+    interrupt during `SLEEP` leaves the task `RUNNING`, and a returned
+    outcome is still written once if the thread is interrupted afterward.
 
 All of the Spring tests extend `PostgresIntegrationTest`, which uses one
 shared Testcontainers PostgreSQL container, deletes every task before
@@ -413,12 +441,12 @@ ADR 0004 and in the roadmap's deviations table.
 M1.1 is in place: `TaskStatus`, the wider `Task` record, and `V4`.
 M1.2 is in place: complete, fail, and cancel are guarded updates, and
 the service classifies a zero-row write instead of retrying it.
-`TaskWorker` still only prints a line, and the HTTP API still cannot
-finish or cancel a task.
+M1.3 is in place: `TaskExecutor.runOnce` claims a task, runs its
+handler with no connection held, and writes the outcome once.
+`TaskWorker` still only prints a line. Nothing pulls tasks in the
+background, and the HTTP API still cannot finish or cancel a task.
 
-The intended shape, once M1 is built, is three short steps: claim in a
-transaction, execute the handler with no transaction, then one complete
-or fail. Leases and failure recovery stay in later milestones.
+Leases and failure recovery stay in later milestones.
 
 ## Planned Development Order
 
@@ -571,8 +599,10 @@ Key design decisions are recorded in `docs/adr/`:
 -   [0003 --- Fencing via the attempt counter](docs/adr/0003-fencing-via-attempt.md)
 -   [0004 --- Task lifecycle and execution model](docs/adr/0004-task-lifecycle-and-execution-model.md)
 
-ADRs 0002, 0003, and 0004 describe planned behavior, not what the code
-does today. Each one says so explicitly.
+ADRs 0002 and 0003 describe planned behavior, not what the code does
+today. ADR 0004's "Current implementation versus planned" section matches
+the code: the lifecycle writes and `TaskExecutor` are in place, and the
+worker pool and versioned API are not.
 
 ## Repository Structure
 
@@ -591,13 +621,15 @@ durable-workflow-engine/
 └── src/
     ├── main/
     │   ├── java/com/kushal/workflow/
-    │   │   └── task/
+    │   │   ├── task/
+    │   │   └── worker/
     │   └── resources/
     │       └── db/migration/
     └── test/
         └── java/com/kushal/workflow/
             ├── support/
-            └── task/
+            ├── task/
+            └── worker/
 ```
 
 The exact structure should evolve with the application rather than being
@@ -605,18 +637,20 @@ created all at once.
 
 ## Current Status
 
-**Milestone: M0 complete. M1.1 and M1.2 are in place. The worker runtime and the versioned API are not.**
+**Milestone: M0 complete. M1.1, M1.2, and M1.3 are in place. The worker pool and the versioned API are not.**
 
 The system can currently create a task, store it in PostgreSQL, safely
 claim a pending task using PostgreSQL row locking, and complete, fail, or
-cancel that task through the service. The `WHERE` clause of each update
-is the lifecycle rule. Concurrent claiming and the cancel-versus-claim
-race are covered by integration tests that run against Testcontainers.
-GitHub Actions runs `./mvnw verify`.
+cancel that task through the service. `TaskExecutor.runOnce` claims one
+pending task, runs `NOOP`, `ECHO`, `FAIL`, or `SLEEP` with no connection
+held, and writes the outcome once. The `WHERE` clause of each update is
+the lifecycle rule. Concurrent claiming, the cancel-versus-claim race,
+and that executor are covered by integration tests that run against
+Testcontainers. GitHub Actions runs `./mvnw verify`.
 
 Not built yet: a worker loop, the versioned REST API, attempts, leases,
 heartbeats, recovery of abandoned tasks, fencing, retries, and
-idempotency. A worker that dies after claiming a task leaves it in
-`RUNNING` until something calls complete or fail. ADR 0004 records the
-rest of the M1 model. The finish guards in that ADR match the code. The
-handler and pool parts do not.
+idempotency. A crash after claim, an interrupt during the handler, or a
+finish write that throws leaves the task `RUNNING`. ADR 0004 records the
+rest of the M1 model. The finish guards and the executor in that ADR
+match the code. The pool does not.
