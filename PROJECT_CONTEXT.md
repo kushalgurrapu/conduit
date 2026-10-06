@@ -81,11 +81,21 @@ Current implementation:
 - Datasource is configured with DB_URL, DB_USERNAME and DB_PASSWORD;
   defaults match the PostgreSQL in docker-compose.yml
 
+TaskExecutor.runOnce claims one pending task, runs the handler for its
+task_type with no transaction and no pooled connection, and writes the
+outcome once. NOOP, ECHO, FAIL, and SLEEP are always registered. SLEEP
+uses the payload's millis and caps it at 60 seconds. An unknown type, a
+thrown exception, or a null return is one fail write. An interrupt during
+the handler leaves the task RUNNING. A returned outcome is still written
+once. A finish write that throws is logged and not retried. Startup fails
+on a duplicate handler type or a type that fails the task_type check.
+
 Not implemented yet: the worker loop, the versioned REST API, attempt
 counter, leases, heartbeats, crash recovery, fencing, retries, idempotency,
 and workflow definitions. TaskWorker is a placeholder that prints a line.
-The temporary POST /tasks and POST /tasks/claim endpoints are still the
-HTTP API. GitHub Actions runs `./mvnw verify`.
+Nothing calls runOnce when the application starts. The temporary POST /tasks
+and POST /tasks/claim endpoints are still the HTTP API. GitHub Actions runs
+`./mvnw verify`.
 
 Verified:
 
@@ -99,6 +109,12 @@ Verified:
 - Complete and fail apply only for the owning worker. A rejected write leaves
   the row unchanged. Cancel applies only to a pending task
   (GuardedTransitionTest, TransitionLockHoldTest)
+- TaskExecutor.runOnce completes ECHO and NOOP, fails FAIL, a thrown
+  exception, an unknown type, and a null return, and does not write when
+  the queue is empty (TaskExecutorTest)
+- A handler runs with no transaction and no borrowed connection
+- An interrupt during SLEEP leaves the task RUNNING with the same worker.
+  A returned outcome is still completed or failed once
 - All integration tests share one Testcontainers PostgreSQL instance and
   do not need a local database
 
@@ -109,9 +125,10 @@ See PROJECT_ROADMAP.md.
 
 M1 is the current milestone: task lifecycle, the REST API, and the worker
 runtime. Roadmap M2 is merged into M1. Those decisions are recorded in
-ADR 0004 and in the roadmap deviations table. M1.1 and M1.2 are
-implemented: the task record, TaskStatus, Flyway V4, and guarded complete,
-fail, and cancel. The worker runtime and the versioned API are not.
+ADR 0004 and in the roadmap deviations table. M1.1, M1.2, and M1.3 are
+implemented: the task record, TaskStatus, Flyway V4, guarded complete,
+fail, and cancel, and TaskExecutor (claim, handler, one finish write).
+The worker pool and the versioned API are not.
 
 After M1:
 
@@ -124,9 +141,10 @@ After M1:
 - scheduling/fairness
 - observability
 
-Design decisions are recorded in docs/adr/. ADRs 0002 (at-least-once),
-0003 (fencing via attempt), and 0004 (lifecycle and execution) describe
-planned behavior, not current code.
+Design decisions are recorded in docs/adr/. ADRs 0002 (at-least-once) and
+0003 (fencing via attempt) describe planned behavior, not current code.
+ADR 0004's current-implementation section matches the code through the
+executor. The pool and the versioned API in that ADR are not built.
 
 
 
