@@ -190,10 +190,26 @@ WHERE id = :id
   AND worker_id = :observedWorkerId;
 ```
 
-`TaskExecutor.runOnce` is what runs one claimed task. Nothing calls it
-when the application starts. `TaskWorker` still only prints a line, and
-there is no background loop yet. A caller (today, a test) does three
-things:
+`TaskExecutor.runOnce` is one claim, one handler call, and one finish
+write. `WorkerPool` calls it from a fixed number of platform threads
+(`engine.worker.concurrency`, default 4) when `engine.worker.enabled`
+is true. Each loop has its own worker id for as long as it lives, and
+the thread is named `host-pid-loopN`. An empty queue waits
+`engine.worker.poll-interval` and then tries again. A loop does not
+pick up a second task while one is still running.
+
+On shutdown the pool stops claiming and waits
+`engine.worker.shutdown-timeout` for work it already claimed. That wait
+must be shorter than `spring.lifecycle.timeout-per-shutdown-phase`
+(30 seconds unless changed). A task already claimed is still executed.
+If a handler is still going when the wait ends, it is interrupted and
+left `RUNNING` when it honors the interrupt. The timeout is not a limit
+on how long a handler may run while the process is up. Hikari's
+`maximum-pool-size` must be at least the worker concurrency plus
+headroom for the API. A handler does not hold a connection. Nothing
+checks that size at startup.
+
+A caller of `runOnce` does three things:
 
 1.  Claim one pending task, in a transaction.
 2.  Run the handler for that `task_type` with no transaction and no
@@ -212,8 +228,8 @@ already returned, that outcome is still written once. Startup fails if
 two handlers use the same type, or if a type does not match the
 `task_type` check.
 
-The worker pool and the versioned API are recorded in
-[ADR 0004](docs/adr/0004-task-lifecycle-and-execution-model.md). They are
+The versioned API is recorded in
+[ADR 0004](docs/adr/0004-task-lifecycle-and-execution-model.md). It is
 not built yet. Further states may be introduced later if they are
 justified by the workflow requirements.
 
@@ -240,9 +256,10 @@ Flyway migrations in `src/main/resources/db/migration` build the schema:
     `PENDING` has none. A `RUNNING` row with no owner is not repaired, so
     the migration fails. If a local Compose database was edited into that
     shape, `docker compose down -v` drops it. A `NOOP` row completes with
-    a JSON null result when `TaskExecutor.runOnce` claims it. Nothing
-    calls that method until the worker pool exists, so a pending row
-    stays pending.
+    a JSON null result when a worker claims it. With
+    `engine.worker.enabled=true` (the default), the pool does that while
+    the application is running. Tests set the flag to false so they can
+    claim rows themselves.
 
 The datasource is read from `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`.
 The defaults match the Compose database, so the application runs without
@@ -261,6 +278,12 @@ docker compose up -d
 
 Use `.\mvnw.cmd` on Windows. `verify` needs Docker running (for
 Testcontainers) but does not need the Compose database.
+
+`spring-boot:run` starts the worker pool. `POST /tasks` still stores
+`NOOP`, so a task created that way is claimed and completed with a JSON
+null result. A database error backs off (`engine.worker.error-backoff`)
+and the loop keeps running. A crash after claim leaves the task
+`RUNNING`; the pool does not pick that row up again.
 
 ## Concurrent Task Claiming
 
@@ -355,6 +378,15 @@ This allows multiple workers to make progress concurrently.
     handler runs with no transaction and no borrowed connection, an
     interrupt during `SLEEP` leaves the task `RUNNING`, and a returned
     outcome is still written once if the thread is interrupted afterward.
+-   `WorkerPoolTest` builds its own pool and stops it afterwards. The
+    shared application pool stays off. Four loops drain fifty tasks with
+    one handler call each. In-flight handlers stay within `concurrency`.
+    Database errors do not kill a loop. Shutdown finishes a task already
+    claimed, including one claimed but not yet executed, and does not
+    claim anything new. A handler still blocked at
+    `shutdown-timeout` is left `RUNNING` with its worker id. A row
+    claimed by hand and never finished stays `RUNNING` while a later
+    task completes.
 
 All of the Spring tests extend `PostgresIntegrationTest`, which uses one
 shared Testcontainers PostgreSQL container, deletes every task before
@@ -393,6 +425,8 @@ The current implementation has successfully demonstrated:
 -   all Flyway migrations apply to a fresh database
 -   integration tests run against Testcontainers, with no local database
     required
+-   a bounded worker pool claims, runs, and finishes tasks, and shutdown
+    does not claim new work (`WorkerPoolTest`)
 
 Example successful state transition:
 
@@ -443,8 +477,9 @@ M1.2 is in place: complete, fail, and cancel are guarded updates, and
 the service classifies a zero-row write instead of retrying it.
 M1.3 is in place: `TaskExecutor.runOnce` claims a task, runs its
 handler with no connection held, and writes the outcome once.
-`TaskWorker` still only prints a line. Nothing pulls tasks in the
-background, and the HTTP API still cannot finish or cancel a task.
+M1.4 is in place: `WorkerPool` runs that cycle on a fixed set of
+platform threads and stops claiming before it interrupts a handler
+that is still going. The HTTP API still cannot finish or cancel a task.
 
 Leases and failure recovery stay in later milestones.
 
@@ -601,8 +636,8 @@ Key design decisions are recorded in `docs/adr/`:
 
 ADRs 0002 and 0003 describe planned behavior, not what the code does
 today. ADR 0004's "Current implementation versus planned" section matches
-the code: the lifecycle writes and `TaskExecutor` are in place, and the
-worker pool and versioned API are not.
+the code: the lifecycle writes, `TaskExecutor`, and the worker pool are
+in place. The versioned API is not.
 
 ## Repository Structure
 
@@ -637,20 +672,23 @@ created all at once.
 
 ## Current Status
 
-**Milestone: M0 complete. M1.1, M1.2, and M1.3 are in place. The worker pool and the versioned API are not.**
+**Milestone: M0 complete. M1.1 through M1.4 are in place. The versioned API is not.**
 
 The system can currently create a task, store it in PostgreSQL, safely
 claim a pending task using PostgreSQL row locking, and complete, fail, or
 cancel that task through the service. `TaskExecutor.runOnce` claims one
 pending task, runs `NOOP`, `ECHO`, `FAIL`, or `SLEEP` with no connection
-held, and writes the outcome once. The `WHERE` clause of each update is
-the lifecycle rule. Concurrent claiming, the cancel-versus-claim race,
-and that executor are covered by integration tests that run against
-Testcontainers. GitHub Actions runs `./mvnw verify`.
+held, and writes the outcome once. `WorkerPool` does that on a fixed
+number of platform threads and, on shutdown, stops claiming, finishes
+work already claimed, and interrupts a handler that is still running
+when `engine.worker.shutdown-timeout` ends. The `WHERE` clause of each
+update is the lifecycle rule. Concurrent claiming, the cancel-versus-claim
+race, the executor, and the pool are covered by integration tests that
+run against Testcontainers. GitHub Actions runs `./mvnw verify`.
 
-Not built yet: a worker loop, the versioned REST API, attempts, leases,
-heartbeats, recovery of abandoned tasks, fencing, retries, and
-idempotency. A crash after claim, an interrupt during the handler, or a
-finish write that throws leaves the task `RUNNING`. ADR 0004 records the
-rest of the M1 model. The finish guards and the executor in that ADR
-match the code. The pool does not.
+Not built yet: the versioned REST API, attempts, leases, heartbeats,
+recovery of abandoned tasks, fencing, retries, and idempotency. A crash
+after claim, an interrupt during the handler, or a finish write that
+throws leaves the task `RUNNING`. ADR 0004 records the rest of the M1
+model. The finish guards, the executor, and the pool in that ADR match
+the code. The versioned API does not.

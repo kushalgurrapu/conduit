@@ -8,6 +8,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -81,6 +83,26 @@ public class TaskRepository {
                 .query(TASK_ROW_MAPPER)
                 .optional()
                 .orElse(null);
+    }
+
+    /**
+     * Ids this pool still owns after shutdown. Used only to log them.
+     * An empty worker list is not a query: an {@code IN ()} is invalid SQL.
+     */
+    public List<UUID> findRunningIdsForWorkers(Collection<UUID> workerIds) {
+        if (workerIds == null || workerIds.isEmpty()) {
+            return List.of();
+        }
+        return jdbcClient.sql("""
+                SELECT id
+                FROM tasks
+                WHERE status = 'RUNNING'
+                  AND worker_id IN (:workerIds)
+                ORDER BY id
+                """)
+                .param("workerIds", workerIds)
+                .query((rs, rowNum) -> rs.getObject("id", UUID.class))
+                .list();
     }
 
     public Optional<Task> findById(UUID id) {

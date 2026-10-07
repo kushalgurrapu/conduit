@@ -90,12 +90,20 @@ the handler leaves the task RUNNING. A returned outcome is still written
 once. A finish write that throws is logged and not retried. Startup fails
 on a duplicate handler type or a type that fails the task_type check.
 
-Not implemented yet: the worker loop, the versioned REST API, attempt
-counter, leases, heartbeats, crash recovery, fencing, retries, idempotency,
-and workflow definitions. TaskWorker is a placeholder that prints a line.
-Nothing calls runOnce when the application starts. The temporary POST /tasks
-and POST /tasks/claim endpoints are still the HTTP API. GitHub Actions runs
-`./mvnw verify`.
+WorkerPool, when engine.worker.enabled is true, calls runOnce from a
+fixed number of platform threads (engine.worker.concurrency, default 4).
+Each loop has one worker id. An empty queue waits poll-interval. Shutdown
+stops new claims, finishes a task already claimed, and interrupts a
+handler still running at shutdown-timeout. That timeout must be shorter
+than spring.lifecycle.timeout-per-shutdown-phase. It is not a handler
+timeout while the process is up. An interrupt leaves the task RUNNING.
+Hikari maximum-pool-size must be at least concurrency plus API headroom.
+Tests set engine.worker.enabled=false and build their own pool.
+
+Not implemented yet: the versioned REST API, attempt counter, leases,
+heartbeats, crash recovery, fencing, retries, idempotency, and workflow
+definitions. The temporary POST /tasks and POST /tasks/claim endpoints
+are still the HTTP API. GitHub Actions runs `./mvnw verify`.
 
 Verified:
 
@@ -117,6 +125,11 @@ Verified:
   A returned outcome is still completed or failed once
 - All integration tests share one Testcontainers PostgreSQL instance and
   do not need a local database
+- WorkerPool drains tasks on four loops with one handler call each, keeps
+  in-flight work within concurrency, survives database errors, finishes
+  claimed work on shutdown without claiming more, leaves a handler
+  interrupted at the deadline RUNNING, and does not finish a crashed
+  claim (WorkerPoolTest)
 
 Current milestone:
 
@@ -125,10 +138,10 @@ See PROJECT_ROADMAP.md.
 
 M1 is the current milestone: task lifecycle, the REST API, and the worker
 runtime. Roadmap M2 is merged into M1. Those decisions are recorded in
-ADR 0004 and in the roadmap deviations table. M1.1, M1.2, and M1.3 are
+ADR 0004 and in the roadmap deviations table. M1.1 through M1.4 are
 implemented: the task record, TaskStatus, Flyway V4, guarded complete,
-fail, and cancel, and TaskExecutor (claim, handler, one finish write).
-The worker pool and the versioned API are not.
+fail, and cancel, TaskExecutor (claim, handler, one finish write), and
+WorkerPool. The versioned API is not.
 
 After M1:
 
@@ -144,7 +157,7 @@ After M1:
 Design decisions are recorded in docs/adr/. ADRs 0002 (at-least-once) and
 0003 (fencing via attempt) describe planned behavior, not current code.
 ADR 0004's current-implementation section matches the code through the
-executor. The pool and the versioned API in that ADR are not built.
+worker pool. The versioned API in that ADR is not built.
 
 
 

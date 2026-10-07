@@ -5,8 +5,26 @@ spring:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/durable_workflow}
     username: ${DB_USERNAME:workflow}
     password: ${DB_PASSWORD:workflow}
+    hikari:
+      # Handlers do not hold a connection. Size the pool for claims,
+      # finishes, and the API together:
+      # maximum-pool-size >= engine.worker.concurrency + API headroom.
+      # Nothing checks this at startup.
+      maximum-pool-size: 10
   flyway:
     enabled: true
+
+# shutdown-timeout must be less than spring.lifecycle.timeout-per-shutdown-phase
+# (Boot default 30s). It is how long shutdown waits before interrupting a
+# handler. It is not a limit on handler runtime while the process is up.
+engine:
+  worker:
+    enabled: true
+    concurrency: 4
+    poll-interval: 1s
+    error-backoff: 1s
+    shutdown-timeout: 20s
+
 management:
   endpoints:
     web:
