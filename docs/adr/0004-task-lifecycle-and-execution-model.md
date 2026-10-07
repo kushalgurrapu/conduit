@@ -262,13 +262,18 @@ invocations.
 
 **Implemented today:**
 
-- Create a task (`POST /tasks`) in `PENDING` with `task_type = 'NOOP'`.
-  The service method is `createTask(taskType, payload)` and returns the
-  inserted row. JSON columns are text at the repository boundary.
+- Create a task (`POST /api/v1/tasks`) in `PENDING`. The body is
+  `taskType` and a JSON `payload`. `taskType` is checked against
+  `^[A-Z][A-Z0-9_]{0,63}$` only. A type with no handler is stored.
+  JSON null and a NUL byte are `400`. The response is `201`, a
+  `TaskResponse`, and `Location: /api/v1/tasks/{id}`. The service method
+  is `createTask(taskType, payload)` and returns the inserted row. JSON
+  columns are text at the repository boundary and JSON values on the wire.
 - `TaskStatus` with `isTerminal()` only. `Task` carries `taskType`,
   `status`, `payload`, `result`, `error`, `createdAt`, `updatedAt`,
   `claimedAt`, `finishedAt`, and `workerId`.
-- Claim one `PENDING` row (`POST /tasks/claim` or `TaskService.claimTask`):
+- Claim one `PENDING` row (`TaskService.claimTask`, called by the worker,
+  not by HTTP):
   `FOR UPDATE SKIP LOCKED`, then `UPDATE ... RETURNING`, inside one
   transaction. The outer update requires `status = 'PENDING'` again, sets
   `updated_at = now()` along with `worker_id` and `claimed_at`, and
@@ -286,7 +291,14 @@ invocations.
 - Cancel (`TaskService.cancelTask`): one update whose `WHERE` is `id` and
   `status = 'PENDING'`. `Cancelled`, `AlreadyCancelled`, and
   `NotCancellable` are values. A missing id is `TaskNotFoundException`.
-  There is no HTTP mapping yet.
+  `POST /api/v1/tasks/{id}/cancel` maps the two cancelled values to `200`
+  and `NotCancellable` to `409`. A missing id is `404`.
+  `GET /api/v1/tasks/{id}` returns the same `TaskResponse`,
+  including `workerId` and `claimedAt`, or `404`. A path id that is not
+  a UUID is `400`. There is no list endpoint, and no HTTP complete or
+  fail. `ApiExceptionHandler` renders RFC 9457 `ProblemDetail`. A
+  database error is a generic `500`; the cause is logged and is not
+  copied into the body. `POST /tasks` and `POST /tasks/claim` are gone.
 - The manual requeue in this ADR is not a repository method. A test runs
   that statement, then shows the old worker's complete is rejected and
   the new worker's complete applies.
@@ -342,9 +354,8 @@ invocations.
 
 **Not implemented:**
 
-- The versioned REST API. There is no GET, no cancel endpoint, and no
-  `ProblemDetail` error model. Complete and fail are not HTTP operations.
-  `POST /tasks` and `POST /tasks/claim` are still the HTTP API.
+- OpenAPI, a list endpoint, `Idempotency-Key`, auth, and HTTP complete,
+  fail, or retry. Complete and fail stay on the worker path.
 
 The named checks hold. The finish guards hold. `TaskExecutorTest` covers
 one finish attempt, no connection during execute, and interruption left

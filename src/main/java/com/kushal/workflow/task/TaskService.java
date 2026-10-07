@@ -26,6 +26,16 @@ public class TaskService {
         return taskRepository.createTask(UUID.randomUUID(), taskType, payload);
     }
 
+    /**
+     * The row as stored. A missing id is {@link TaskNotFoundException}.
+     * This read does not lock the row and does not change it.
+     */
+    public Task getTask(UUID taskId) {
+        requireTaskId(taskId);
+        return taskRepository.findById(taskId)
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
+    }
+
     @Transactional
     public Task claimTask(UUID workerId) {
         requireWorkerId(workerId);
