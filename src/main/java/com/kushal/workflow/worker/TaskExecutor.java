@@ -28,9 +28,19 @@ public class TaskExecutor {
 
     private static final Logger log = LoggerFactory.getLogger(TaskExecutor.class);
 
+    private static final Runnable NO_AFTER_CLAIM = () -> {
+    };
+
     private final TaskService taskService;
     private final Map<String, TaskHandler> taskHandlers;
     private final JsonMapper jsonMapper;
+
+    /**
+     * Runs after a claim has committed and before the handler. Empty in
+     * production. A test stops the pool from here. Nothing in this class
+     * reads a shutdown flag: a claimed task is always executed.
+     */
+    private volatile Runnable afterClaim = NO_AFTER_CLAIM;
 
     public TaskExecutor(
             TaskService taskService,
@@ -59,6 +69,7 @@ public class TaskExecutor {
             MDC.put("taskId", claimed.id().toString());
             MDC.put("taskType", claimed.taskType());
             try {
+                afterClaim.run();
                 runClaimed(claimed, workerId);
                 return true;
             } finally {
@@ -68,6 +79,14 @@ public class TaskExecutor {
         } finally {
             MDC.remove("workerId");
         }
+    }
+
+    /**
+     * Test hook. Pass {@code null} to clear it. The runnable runs on the
+     * worker thread, after claim and before {@link TaskHandler#execute}.
+     */
+    void setAfterClaim(Runnable afterClaim) {
+        this.afterClaim = afterClaim == null ? NO_AFTER_CLAIM : afterClaim;
     }
 
     private void runClaimed(Task claimed, UUID workerId) {

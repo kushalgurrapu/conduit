@@ -5,9 +5,9 @@
 Accepted
 
 This is the M1 decision. The schema, the `Task` record, claim, the
-guarded complete, fail, and cancel writes, and `TaskExecutor` (claim,
-handler, one finish write) are implemented. The worker pool and the
-versioned REST API are not. See "Current implementation versus planned".
+guarded complete, fail, and cancel writes, `TaskExecutor` (claim,
+handler, one finish write), and the worker pool are implemented. The
+versioned REST API is not. See "Current implementation versus planned".
 
 Roadmap M2 (the worker runtime) is merged into M1. Leases, recovery, and
 retries stay in M3-M5. This is the only ADR for the M1 lifecycle and
@@ -15,9 +15,8 @@ execution model.
 
 ## Context
 
-Claiming a task is not executing it. Today a claim moves a row from
-`PENDING` to `RUNNING` and then stops. There is no complete, fail, or
-cancel operation, and `TaskWorker` only prints a line. A row can sit in
+Claiming a task is not executing it. A claim moves a row from
+`PENDING` to `RUNNING`. Without a finish write, a row can sit in
 `RUNNING` with no record of whether a handler ran, crashed, or never
 started.
 
@@ -211,12 +210,15 @@ and the engine does not yet defend against it.
 
 ### Guarantees M1 will make, and will not make
 
-These are the claims M1 may make once the tests exist. The finish guards
-are implemented: one applied complete or fail per claim, only from the
+These are the claims the tests support. The finish guards are
+implemented: one applied complete or fail per claim, only from the
 owning `worker_id`, and cancel only from `PENDING`. `TaskExecutorTest`
 covers no connection during execute, one finish attempt, and an
-interrupt left as `RUNNING`. The items that need a worker pool are not
-claims about the code today.
+interrupt left as `RUNNING`. `WorkerPoolTest` covers the concurrency
+cap, one handler call per drained task, shutdown that finishes claimed
+work without new claims, an interrupt at the shutdown deadline left as
+`RUNNING`, and a crashed claim that stays `RUNNING` while a later task
+completes.
 
 M1 provides:
 
@@ -318,20 +320,37 @@ invocations.
   else is logged. If the finish write throws, it is logged, the row
   stays `RUNNING`, and `runOnce` returns true. An empty queue returns
   false. MDC holds `taskId`, `workerId`, and `taskType` for the cycle.
+- `WorkerPool` is a `SmartLifecycle`. It starts when
+  `engine.worker.enabled` is true (the default; tests set it false) and
+  runs `engine.worker.concurrency` platform threads (default 4). Each
+  loop has one UUID for its lifetime and a thread name
+  `host-pid-loopN`. The loop calls `runOnce`. It reads the stop flag
+  only before that call, so a task already claimed is still executed.
+  An empty claim waits `poll-interval` on a latch that shutdown opens.
+  `DataAccessException` and `TransactionException` are logged, then the
+  loop waits `error-backoff` and continues. Any other `Exception` is
+  logged and the loop continues. An `Error` kills that loop only.
+- Shutdown sets the stop flag, wakes idle loops, and waits
+  `shutdown-timeout` (default 20s). That duration must be shorter than
+  `spring.lifecycle.timeout-per-shutdown-phase` (Boot default 30s). It
+  is not a limit on handler runtime while the process is up. When the
+  wait ends, handlers still running are interrupted. An interrupt leaves
+  the task `RUNNING`. The pool logs those task ids as still running at
+  the deadline; a late finish is still possible. There is no startup
+  check that Hikari `maximum-pool-size` is at least concurrency plus
+  API headroom. That rule is documented in `application.yaml`.
 
 **Not implemented:**
 
-- A worker loop and graceful shutdown. `TaskWorker` prints a line.
-  Nothing calls `runOnce` when the process starts.
 - The versioned REST API. There is no GET, no cancel endpoint, and no
   `ProblemDetail` error model. Complete and fail are not HTTP operations.
+  `POST /tasks` and `POST /tasks/claim` are still the HTTP API.
 
 The named checks hold. The finish guards hold. `TaskExecutorTest` covers
 one finish attempt, no connection during execute, and interruption left
-as `RUNNING`. There is still no worker loop, so the concurrency cap and
-the stop behavior are not claims about the code today. A crash after
-claim leaves the task `RUNNING` with no further progress. That is a
-lost task, not at-least-once execution (ADR 0002).
+as `RUNNING`. `WorkerPoolTest` covers the concurrency cap and the stop
+behavior. A crash after claim leaves the task `RUNNING` with no further
+progress. That is a lost task, not at-least-once execution (ADR 0002).
 
 ## Consequences
 
