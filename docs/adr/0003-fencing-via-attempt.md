@@ -76,8 +76,9 @@ and the new execution would then look identical. The pair
 - Fencing protects the engine's state. It does **not** stop a stale worker
   from causing side effects outside the engine. That is the job of
   idempotency (ADR 0002).
-- Today `POST /tasks/claim` uses a random `worker_id` per call. A stable,
-  per-worker identity belongs to the worker loop work.
+- There is no HTTP claim endpoint. Each worker loop has one UUID for its
+  lifetime (ADR 0004). That id is still not a fence against a later claim
+  of the same row. Fencing needs `attempt`.
 
 ## Future implications
 

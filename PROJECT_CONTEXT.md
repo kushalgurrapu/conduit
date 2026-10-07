@@ -55,9 +55,12 @@ statement in ADR 0004 is documentation and a test, not an API.
 
 Current implementation:
 
-- POST /tasks creates a task. The body is the payload. The task type is
-  stored as NOOP until the versioned API accepts a type
-- POST /tasks/claim is a temporary test endpoint that claims with a random worker id
+- POST /api/v1/tasks creates a task. The body is taskType plus a JSON
+  payload. taskType is format-checked only. GET /api/v1/tasks/{id} returns
+  the task. POST /api/v1/tasks/{id}/cancel returns 200 for PENDING or
+  already CANCELLED, 409 for RUNNING or another terminal status, and 404
+  when the id is missing. Errors are ProblemDetail. There is no HTTP
+  claim, complete, or fail
 - TaskRepository uses JdbcClient
 - TaskService owns transaction boundaries
 - Task claiming uses FOR UPDATE SKIP LOCKED
@@ -100,10 +103,9 @@ timeout while the process is up. An interrupt leaves the task RUNNING.
 Hikari maximum-pool-size must be at least concurrency plus API headroom.
 Tests set engine.worker.enabled=false and build their own pool.
 
-Not implemented yet: the versioned REST API, attempt counter, leases,
-heartbeats, crash recovery, fencing, retries, idempotency, and workflow
-definitions. The temporary POST /tasks and POST /tasks/claim endpoints
-are still the HTTP API. GitHub Actions runs `./mvnw verify`.
+Not implemented yet: attempt counter, leases, heartbeats, crash recovery,
+fencing, retries, idempotency, and workflow definitions. GitHub Actions
+runs `./mvnw verify`.
 
 Verified:
 
@@ -130,6 +132,12 @@ Verified:
   claimed work on shutdown without claiming more, leaves a handler
   interrupted at the deadline RUNNING, and does not finish a crashed
   claim (WorkerPoolTest)
+- POST /api/v1/tasks returns 201 and Location. GET returns the task.
+  Cancel of a pending task returns 200, cancel again stays 200, and
+  cancel of a running task returns 409 and leaves the row RUNNING
+  (TaskControllerTest, TaskApiTest). A type with no handler is accepted.
+  A bad type, JSON null, a NUL byte, and unreadable JSON are 400
+  ProblemDetail. A missing id is 404. A database error is a generic 500
 
 Current milestone:
 
@@ -138,10 +146,10 @@ See PROJECT_ROADMAP.md.
 
 M1 is the current milestone: task lifecycle, the REST API, and the worker
 runtime. Roadmap M2 is merged into M1. Those decisions are recorded in
-ADR 0004 and in the roadmap deviations table. M1.1 through M1.4 are
+ADR 0004 and in the roadmap deviations table. M1.1 through M1.5 are
 implemented: the task record, TaskStatus, Flyway V4, guarded complete,
-fail, and cancel, TaskExecutor (claim, handler, one finish write), and
-WorkerPool. The versioned API is not.
+fail, and cancel, TaskExecutor (claim, handler, one finish write),
+WorkerPool, and `/api/v1/tasks` (create, get, cancel).
 
 After M1:
 
@@ -157,7 +165,7 @@ After M1:
 Design decisions are recorded in docs/adr/. ADRs 0002 (at-least-once) and
 0003 (fencing via attempt) describe planned behavior, not current code.
 ADR 0004's current-implementation section matches the code through the
-worker pool. The versioned API in that ADR is not built.
+`/api/v1/tasks` API.
 
 
 

@@ -1,6 +1,11 @@
 spring:
   application:
     name: durable-workflow-engine
+  mvc:
+    # RFC 9457 bodies for MVC errors (validation, unreadable JSON, bad path
+    # values). ApiExceptionHandler uses the same shape for 404, 409, and 500.
+    problemdetails:
+      enabled: true
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/durable_workflow}
     username: ${DB_USERNAME:workflow}

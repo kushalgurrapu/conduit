@@ -89,21 +89,45 @@ PostgreSQL
 
 ### Controller
 
-`TaskController` exposes the HTTP API.
-
-Current endpoints:
+`TaskController` exposes the HTTP API. Claim, complete, and fail are not
+HTTP operations. A worker calls the service for those.
 
 ``` text
-POST /tasks
-POST /tasks/claim
+POST /api/v1/tasks
+GET  /api/v1/tasks/{id}
+POST /api/v1/tasks/{id}/cancel
 ```
 
-`POST /tasks` creates a new task. The body is the JSON payload. The task
-type is stored as `NOOP` until the versioned API accepts a type.
+`POST /api/v1/tasks` creates a task and returns `201` with
+`Location: /api/v1/tasks/{id}` and a `TaskResponse`. The body is
+`taskType` plus a JSON `payload`. `taskType` must match
+`^[A-Z][A-Z0-9_]{0,63}$`. A type that matches and has no handler is still
+accepted. The worker fails that task later. JSON null and a NUL byte in
+a key or a text value are `400`.
 
-`POST /tasks/claim` is currently a temporary testing endpoint used to
-exercise the task-claiming logic. It will eventually be replaced by the
-worker itself calling the service layer.
+`GET /api/v1/tasks/{id}` returns the task, including `workerId` and
+`claimedAt`, or `404`.
+
+`POST /api/v1/tasks/{id}/cancel` returns `200` when the task is `PENDING`
+or already `CANCELLED`, `409` when it is `RUNNING` or another terminal
+status, and `404` when the id is missing.
+
+Errors use RFC 9457 `ProblemDetail` (`application/problem+json`). A
+database failure is a generic `500`. The response does not include the
+exception text.
+
+``` text
+curl -sS -D - -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d "{\"taskType\":\"ECHO\",\"payload\":{\"message\":\"hello\"}}"
+
+curl -sS http://localhost:8080/api/v1/tasks/{id}
+
+curl -sS -X POST http://localhost:8080/api/v1/tasks/{id}/cancel
+```
+
+With the worker pool running, `ECHO` may already be `COMPLETED` by the
+time `GET` runs. Cancel applies only while the task is still `PENDING`.
 
 ### Service
 
@@ -228,10 +252,8 @@ already returned, that outcome is still written once. Startup fails if
 two handlers use the same type, or if a type does not match the
 `task_type` check.
 
-The versioned API is recorded in
-[ADR 0004](docs/adr/0004-task-lifecycle-and-execution-model.md). It is
-not built yet. Further states may be introduced later if they are
-justified by the workflow requirements.
+The HTTP API is the controller section above. Further states may be
+introduced later if they are justified by the workflow requirements.
 
 ## Database
 
@@ -279,11 +301,11 @@ docker compose up -d
 Use `.\mvnw.cmd` on Windows. `verify` needs Docker running (for
 Testcontainers) but does not need the Compose database.
 
-`spring-boot:run` starts the worker pool. `POST /tasks` still stores
-`NOOP`, so a task created that way is claimed and completed with a JSON
-null result. A database error backs off (`engine.worker.error-backoff`)
-and the loop keeps running. A crash after claim leaves the task
-`RUNNING`; the pool does not pick that row up again.
+`spring-boot:run` starts the worker pool. `POST /api/v1/tasks` with
+`taskType` `ECHO`, `FAIL`, `SLEEP`, or `NOOP` is claimed by that pool.
+A database error backs off (`engine.worker.error-backoff`) and the loop
+keeps running. A crash after claim leaves the task `RUNNING`; the pool
+does not pick that row up again.
 
 ## Concurrent Task Claiming
 
@@ -402,7 +424,7 @@ The current implementation has successfully demonstrated:
 -   Spring Boot starts successfully
 -   PostgreSQL runs through Docker
 -   Flyway creates the database schema
--   tasks can be created through `POST /tasks`
+-   tasks can be created, read, and cancelled through `/api/v1/tasks`
 -   the application can communicate with PostgreSQL
 -   a pending task can be claimed
 -   a claimed task changes from `PENDING` to `RUNNING`
@@ -636,8 +658,8 @@ Key design decisions are recorded in `docs/adr/`:
 
 ADRs 0002 and 0003 describe planned behavior, not what the code does
 today. ADR 0004's "Current implementation versus planned" section matches
-the code: the lifecycle writes, `TaskExecutor`, and the worker pool are
-in place. The versioned API is not.
+the code: the lifecycle writes, `TaskExecutor`, the worker pool, and the
+`/api/v1/tasks` API are in place.
 
 ## Repository Structure
 
@@ -656,12 +678,14 @@ durable-workflow-engine/
 └── src/
     ├── main/
     │   ├── java/com/kushal/workflow/
+    │   │   ├── api/
     │   │   ├── task/
     │   │   └── worker/
     │   └── resources/
     │       └── db/migration/
     └── test/
         └── java/com/kushal/workflow/
+            ├── api/
             ├── support/
             ├── task/
             └── worker/
@@ -672,7 +696,7 @@ created all at once.
 
 ## Current Status
 
-**Milestone: M0 complete. M1.1 through M1.4 are in place. The versioned API is not.**
+**Milestone: M0 complete. M1.1 through M1.5 are in place.**
 
 The system can currently create a task, store it in PostgreSQL, safely
 claim a pending task using PostgreSQL row locking, and complete, fail, or
@@ -686,9 +710,9 @@ update is the lifecycle rule. Concurrent claiming, the cancel-versus-claim
 race, the executor, and the pool are covered by integration tests that
 run against Testcontainers. GitHub Actions runs `./mvnw verify`.
 
-Not built yet: the versioned REST API, attempts, leases, heartbeats,
-recovery of abandoned tasks, fencing, retries, and idempotency. A crash
-after claim, an interrupt during the handler, or a finish write that
-throws leaves the task `RUNNING`. ADR 0004 records the rest of the M1
-model. The finish guards, the executor, and the pool in that ADR match
-the code. The versioned API does not.
+Not built yet: attempts, leases, heartbeats, recovery of abandoned
+tasks, fencing, retries, and idempotency. A crash after claim, an
+interrupt during the handler, or a finish write that throws leaves the
+task `RUNNING`. ADR 0004 records the rest of the M1 model. The finish
+guards, the executor, the pool, and `/api/v1/tasks` in that ADR match
+the code. Docs and a curl demo that waits until a task finishes are M1.6.

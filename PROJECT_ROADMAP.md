@@ -8,6 +8,8 @@ This roadmap was written on 2026-10-02 from a read of the repo at that time: `po
 
 **Update (M1.4, 2026-10-05):** M1.1 (`TaskStatus`, `Task`, Flyway V4), M1.2 (guarded complete, fail, and cancel), M1.3 (`TaskExecutor`, handlers, one finish write), and M1.4 (`WorkerPool`, graceful shutdown) are implemented. The versioned API is not. The placeholder `TaskWorker` has been removed.
 
+**Update (M1.5, 2026-10-06):** `POST /api/v1/tasks`, `GET /api/v1/tasks/{id}`, and `POST /api/v1/tasks/{id}/cancel` are the HTTP API. `taskType` is format-checked only. Errors are `ProblemDetail`. `POST /tasks` and `POST /tasks/claim` are gone. There is no list endpoint.
+
 ---
 
 ## 0. Where the repo actually is today
