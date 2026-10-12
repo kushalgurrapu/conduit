@@ -4,10 +4,10 @@
 
 Accepted
 
-This is the M1 decision. The schema, the `Task` record, claim, the
-guarded complete, fail, and cancel writes, `TaskExecutor` (claim,
-handler, one finish write), and the worker pool are implemented. The
-versioned REST API is not. See "Current implementation versus planned".
+This is the M1 decision, and M1.0 through M1.6 are in place. The schema,
+the `Task` record, claim, the guarded complete, fail, and cancel writes,
+`TaskExecutor`, the worker pool, and `/api/v1/tasks` (create, get,
+cancel) match "Current implementation versus planned".
 
 Roadmap M2 (the worker runtime) is merged into M1. Leases, recovery, and
 retries stay in M3-M5. This is the only ADR for the M1 lifecycle and
@@ -365,8 +365,9 @@ progress. That is a lost task, not at-least-once execution (ADR 0002).
 
 ## Consequences
 
-- Docs may describe this model as the M1 target. They must not describe
-  it as current behavior until the tests exist.
+- This model is current behavior. The tests named above cover it. Docs
+  must not add a guarantee those tests do not show. At-least-once stays
+  in ADR 0002 until recovery exists.
 - Handlers written for M1 must still tolerate a later second run. M1 does
   not promise they run only once for the life of the row.
 - `FAILED` in M1 is terminal. Callers cannot expect an automatic retry.

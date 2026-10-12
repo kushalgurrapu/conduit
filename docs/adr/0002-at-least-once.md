@@ -47,15 +47,24 @@ say "effectively once" for effects that are idempotent.
 
 ## Current implementation versus planned
 
-**Implemented today:** task creation and claiming (`PENDING` to `RUNNING`).
+**Implemented today:** create, claim (`PENDING` to `RUNNING`), complete,
+fail, and cancel. A worker loop claims a task, runs the handler with no
+connection held, and writes the outcome once. `POST /api/v1/tasks` creates
+a task; `GET` reads it until the status is terminal.
 
-**Not implemented:** completing or failing a task, leases, heartbeats,
-recovery of abandoned tasks, retries, and idempotency keys.
+**Not implemented:** leases, heartbeats, recovery of abandoned tasks,
+retries, and idempotency keys.
 
-This means the current behavior after a worker crash is that the task stays
-`RUNNING` forever. The code is not yet at-least-once. A lost task is the
-at-most-once outcome. At-least-once is the target that the planned lease,
-recovery, and retry work is meant to reach.
+A crash after claim, an interrupt during the handler, or a finish write
+that throws leaves the task `RUNNING`. Nothing in the engine puts that
+row back to `PENDING`. The code is not at-least-once. A stuck task is
+lost work until an operator requeues it by hand (ADR 0004) or until
+recovery exists (M4). At-least-once is still the target of that later
+work.
+
+"The handler ran at most once" is this process's control flow. It is not
+a durability guarantee. A manual requeue, or a future reaper, runs the
+handler again.
 
 ## Consequences
 

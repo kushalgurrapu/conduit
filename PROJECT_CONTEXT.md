@@ -144,12 +144,15 @@ Current milestone:
 M0 (foundation hardening) is complete, including GitHub Actions CI.
 See PROJECT_ROADMAP.md.
 
-M1 is the current milestone: task lifecycle, the REST API, and the worker
-runtime. Roadmap M2 is merged into M1. Those decisions are recorded in
-ADR 0004 and in the roadmap deviations table. M1.1 through M1.5 are
-implemented: the task record, TaskStatus, Flyway V4, guarded complete,
-fail, and cancel, TaskExecutor (claim, handler, one finish write),
-WorkerPool, and `/api/v1/tasks` (create, get, cancel).
+M1 is complete (M1.0 through M1.6): task lifecycle, the REST API, and the
+worker runtime. Roadmap M2 is merged into M1. Those decisions are recorded
+in ADR 0004 and in the roadmap deviations table. Implemented: the task
+record, TaskStatus, Flyway V4, guarded complete, fail, and cancel,
+TaskExecutor (claim, handler, one finish write), WorkerPool, and
+`/api/v1/tasks` (create, get, cancel). The README states the M1 guarantees
+and the known limitations, including stuck RUNNING, legacy rows, kill -9
+versus a host crash, owner-pinned manual requeue, and that RUNNING is not
+"currently executing".
 
 After M1:
 
@@ -163,9 +166,10 @@ After M1:
 - observability
 
 Design decisions are recorded in docs/adr/. ADRs 0002 (at-least-once) and
-0003 (fencing via attempt) describe planned behavior, not current code.
-ADR 0004's current-implementation section matches the code through the
-`/api/v1/tasks` API.
+0003 (fencing via attempt) are accepted targets. Their current-implementation
+notes match the code: finish writes exist, and recovery and the attempt
+fence do not. ADR 0004's current-implementation section matches the code
+through `/api/v1/tasks`.
 
 
 
