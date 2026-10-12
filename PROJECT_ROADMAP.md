@@ -10,6 +10,8 @@ This roadmap was written on 2026-10-02 from a read of the repo at that time: `po
 
 **Update (M1.5, 2026-10-06):** `POST /api/v1/tasks`, `GET /api/v1/tasks/{id}`, and `POST /api/v1/tasks/{id}/cancel` are the HTTP API. `taskType` is format-checked only. Errors are `ProblemDetail`. `POST /tasks` and `POST /tasks/claim` are gone. There is no list endpoint.
 
+**Update (M1.6, 2026-10-06):** M1.0 through M1.6 are done. The README states the ADR 0004 guarantees and the known limitations: stuck `RUNNING` (crash, interrupt, or a failed finish write), legacy `RUNNING` rows from `POST /tasks/claim`, legacy `PENDING` rows stored as `NOOP`, `kill -9` versus a host crash that can hold a lock, owner-pinned manual requeue (safe for the row; the handler may run twice), and `RUNNING` is not "currently executing". ADR 0002, 0003, and 0004 current-implementation notes match the code. A curl demo creates `ECHO`, `FAIL`, and `SLEEP` and reads each task until it is terminal. Next milestone is M3.
+
 ---
 
 ## 0. Where the repo actually is today
@@ -237,6 +239,8 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 ---
 
 ## M1. Task lifecycle, API, and worker runtime
+
+**Status:** complete (M1.0-M1.6, 2026-10-06).
 
 **Complexity:** Medium. **Time:** original M1 (1-1.5 weeks) plus former M2 (1.5-2 weeks), implemented as M1.0-M1.6. **Depends on:** M0.
 

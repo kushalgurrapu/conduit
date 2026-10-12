@@ -121,13 +121,26 @@ curl -sS -D - -X POST http://localhost:8080/api/v1/tasks \
   -H "Content-Type: application/json" \
   -d "{\"taskType\":\"ECHO\",\"payload\":{\"message\":\"hello\"}}"
 
+curl -sS -D - -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d "{\"taskType\":\"FAIL\",\"payload\":{\"reason\":\"demo\"}}"
+
+curl -sS -D - -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d "{\"taskType\":\"SLEEP\",\"payload\":{\"millis\":500}}"
+
 curl -sS http://localhost:8080/api/v1/tasks/{id}
 
 curl -sS -X POST http://localhost:8080/api/v1/tasks/{id}/cancel
 ```
 
-With the worker pool running, `ECHO` may already be `COMPLETED` by the
-time `GET` runs. Cancel applies only while the task is still `PENDING`.
+With the worker pool running, repeat `GET` until `status` is `COMPLETED`,
+`FAILED`, or `CANCELLED`. `ECHO` finishes `COMPLETED` and stores the
+payload as `result`. `FAIL` finishes `FAILED` and stores `reason` as
+`error` (the error is `failed` when `reason` is absent). `SLEEP` waits
+for `millis`, at most 60 seconds, and then finishes `COMPLETED`. Cancel
+applies only while the task is still `PENDING`. On Windows, PowerShell's
+`curl` is an alias; use `curl.exe`.
 
 ### Service
 
@@ -189,12 +202,25 @@ fail     RUNNING -> FAILED       only that worker
 cancel   PENDING -> CANCELLED
 ```
 
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: create
+    PENDING --> RUNNING: claim
+    PENDING --> CANCELLED: cancel
+    RUNNING --> COMPLETED: complete, owning worker
+    RUNNING --> FAILED: fail, owning worker
+    COMPLETED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]
+```
+
 A task begins as `PENDING`. Claim moves it to `RUNNING` and records the
 worker. Complete and fail then set `finished_at` and `updated_at`. Cancel
 does the same, and only while the task is still pending. If the `UPDATE`
 changes zero rows, the service reads the row once to name the outcome
 (already applied, already cancelled, or rejected). That read does not
-write again. The HTTP API does not expose complete, fail, or cancel yet.
+write again. Complete and fail are not HTTP operations. Cancel is
+`POST /api/v1/tasks/{id}/cancel`.
 
 Calling complete again with a different result does not overwrite the
 first result. The second call is "already applied" when the same worker
@@ -222,16 +248,32 @@ the thread is named `host-pid-loopN`. An empty queue waits
 `engine.worker.poll-interval` and then tries again. A loop does not
 pick up a second task while one is still running.
 
-On shutdown the pool stops claiming and waits
-`engine.worker.shutdown-timeout` for work it already claimed. That wait
-must be shorter than `spring.lifecycle.timeout-per-shutdown-phase`
-(30 seconds unless changed). A task already claimed is still executed.
-If a handler is still going when the wait ends, it is interrupted and
-left `RUNNING` when it honors the interrupt. The timeout is not a limit
-on how long a handler may run while the process is up. Hikari's
-`maximum-pool-size` must be at least the worker concurrency plus
-headroom for the API. A handler does not hold a connection. Nothing
-checks that size at startup.
+`engine.worker` settings, with the defaults from `application.yaml`:
+
+-   `enabled` (`true`): start the pool with the application. Tests set
+    this to `false` and build their own pool.
+-   `concurrency` (`4`): platform-thread loops. In-flight handlers never
+    exceed this number. Each loop pulls one task at a time and does not
+    prefetch.
+-   `poll-interval` (`1s`): how long an idle loop waits before claiming
+    again.
+-   `error-backoff` (`1s`): wait after a database or transaction error,
+    then keep looping.
+-   `shutdown-timeout` (`20s`): how long shutdown waits for work already
+    claimed before interrupting it. This must be shorter than
+    `spring.lifecycle.timeout-per-shutdown-phase` (30 seconds unless
+    changed). It is not a limit on how long a handler may run while the
+    process is up.
+
+On shutdown the pool stops claiming, then waits `shutdown-timeout`. A
+task already claimed is still executed. If a handler is still going when
+the wait ends, it is interrupted and left `RUNNING` when it honors the
+interrupt.
+
+Hikari `maximum-pool-size` (default 10) must be at least
+`engine.worker.concurrency` plus headroom for API requests. A handler
+does not hold a connection, so the pool is not sized as one connection
+per running handler. Nothing checks that size at startup.
 
 A caller of `runOnce` does three things:
 
@@ -254,6 +296,78 @@ two handlers use the same type, or if a type does not match the
 
 The HTTP API is the controller section above. Further states may be
 introduced later if they are justified by the workflow requirements.
+
+## Guarantees
+
+These are the M1 guarantees. They match ADR 0004 and the tests named
+under "How this is tested". They are not a promise of exactly-once or
+at-least-once delivery.
+
+1.  **This process** claims a given `PENDING` row at most once and never
+    puts it back to `PENDING`. A crash after claim and before the handler
+    runs leaves the row `RUNNING` with zero handler calls.
+2.  At most one **applied** `COMPLETED` or `FAILED` write per claim, and
+    only from the claiming loop (`WHERE id AND status = 'RUNNING' AND
+    worker_id`). Terminal states stay terminal because of that `WHERE`,
+    not because a `CHECK` can see the previous status. Cancel applies
+    only to `PENDING`.
+3.  Named V4 checks: `finished_at` is set exactly when the status is
+    terminal; `RUNNING` has an owner; `PENDING` has none; `task_type`
+    matches `^[A-Z][A-Z0-9_]{0,63}$`.
+4.  No transaction and no pooled connection is held while a handler runs.
+5.  In-flight handlers never exceed `engine.worker.concurrency`. Pull is
+    one task at a time, with no prefetch.
+6.  After stop: no new claims; a claimed task is always executed; a
+    **returned** outcome gets one finish attempt; a handler still running
+    at the deadline is interrupted and left `RUNNING` if it honors the
+    interrupt.
+7.  `RUNNING` means **claimed and not finished**. The database cannot
+    tell a live handler from a crash, an interrupt, or a finish write
+    that threw.
+8.  The manual requeue above is safe for **engine state** when it pins
+    the worker that was observed. The handler may already have run, and
+    it may run again.
+
+M1 does not provide, and this document does not claim:
+
+-   exactly-once execution
+-   at-least-once execution (that is ADR 0002, after recovery in M4)
+-   automatic recovery or a reaper
+-   that a returned outcome always commits (`RUNNING` after a failed
+    finish write is allowed)
+-   rejection of a stale writer from a **later** claim that reuses the
+    same `worker_id` (that is ADR 0003, via `attempt`, in M3)
+-   handler timeouts or detection of a hung worker
+-   task-level retries
+
+"The handler ran at most once" describes this process's control flow.
+It is not a durability guarantee. A manual requeue, and a future reaper,
+are second invocations.
+
+## Known limitations
+
+-   **Stuck `RUNNING`.** A crash after claim, an interrupt during the
+    handler, or a finish write that throws leaves the task `RUNNING`.
+    The pool does not claim that row again.
+-   **Legacy `RUNNING` rows.** `POST /tasks/claim` used to claim a task
+    and leave it `RUNNING`, because nothing finished it. Those rows stay
+    `RUNNING`. V4 does not repair them. A `RUNNING` row with no owner
+    fails the V4 migration instead.
+-   **Legacy `PENDING` rows.** Rows that existed before V4 were stored as
+    `task_type = 'NOOP'`. A worker completes them as no-ops (JSON null
+    result).
+-   **`kill -9` versus a host crash.** `kill -9` after the claim
+    transaction has committed leaves the task `RUNNING`. `kill -9` during
+    that transaction rolls the claim back, so the row stays `PENDING`,
+    because the kernel closes the database socket. A host crash or a
+    network partition can hold the row lock until TCP keepalive ends.
+    Production does not set `idle_in_transaction_session_timeout`.
+-   **Manual requeue.** The owner-pinned `UPDATE` above is safe for the
+    row. It is not safe for side effects: the handler may run twice.
+-   **`RUNNING` is not "currently executing".** It means the row was
+    claimed and has not finished. The handler may be running, may have
+    crashed, may have been interrupted, or may have returned an outcome
+    whose finish write did not commit.
 
 ## Database
 
@@ -306,6 +420,25 @@ Testcontainers) but does not need the Compose database.
 A database error backs off (`engine.worker.error-backoff`) and the loop
 keeps running. A crash after claim leaves the task `RUNNING`; the pool
 does not pick that row up again.
+
+### Demo
+
+With Compose and the application running, create a task and read it
+until the status is terminal. `ECHO` finishes `COMPLETED`:
+
+``` text
+curl -sS -D - -X POST http://localhost:8080/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d "{\"taskType\":\"ECHO\",\"payload\":{\"message\":\"hello\"}}"
+
+curl -sS http://localhost:8080/api/v1/tasks/{id}
+```
+
+Repeat `GET` until `status` is `COMPLETED`. The same create with `FAIL`
+and `"reason":"demo"` finishes `FAILED`, and `error` is `demo`. The same
+create with `SLEEP` and `"millis":500` finishes `COMPLETED` after the
+sleep. A task that is still `PENDING` can be cancelled with
+`POST /api/v1/tasks/{id}/cancel`.
 
 ## Concurrent Task Claiming
 
@@ -490,20 +623,19 @@ Done in M0:
 -   this documentation and the first architecture decision records
 -   a GitHub Actions workflow that runs `./mvnw verify`
 
-**M1 --- task lifecycle, API, and worker runtime** is the current
-milestone. Roadmap M2 is merged into M1. The decisions are recorded in
-ADR 0004 and in the roadmap's deviations table.
+**M1 --- task lifecycle, API, and worker runtime** is complete
+(M1.0 through M1.6). Roadmap M2 is merged into M1. The decisions are
+recorded in ADR 0004 and in the roadmap's deviations table. The
+guarantees and the known limitations are the sections above.
 
-M1.1 is in place: `TaskStatus`, the wider `Task` record, and `V4`.
-M1.2 is in place: complete, fail, and cancel are guarded updates, and
-the service classifies a zero-row write instead of retrying it.
-M1.3 is in place: `TaskExecutor.runOnce` claims a task, runs its
-handler with no connection held, and writes the outcome once.
-M1.4 is in place: `WorkerPool` runs that cycle on a fixed set of
-platform threads and stops claiming before it interrupts a handler
-that is still going. The HTTP API still cannot finish or cancel a task.
+M1.1 added `TaskStatus`, the wider `Task` record, and `V4`. M1.2 made
+complete, fail, and cancel guarded updates. M1.3 added
+`TaskExecutor.runOnce`: claim, handler with no connection held, one
+finish write. M1.4 added `WorkerPool`. M1.5 added `/api/v1/tasks`
+(create, get, cancel). M1.6 is this documentation and the curl demo.
+Complete and fail stay on the worker. They are not HTTP operations.
 
-Leases and failure recovery stay in later milestones.
+Leases and failure recovery are M3 and M4. They are not part of M1.
 
 ## Planned Development Order
 
@@ -527,11 +659,11 @@ The project should progress roughly in this order:
 
 ### Phase 2 --- Workers
 
--   [ ] Worker abstraction
--   [ ] Worker loop
--   [ ] Multiple workers
--   [ ] Graceful shutdown
--   [ ] Concurrent integration tests
+-   [x] Worker abstraction
+-   [x] Worker loop
+-   [x] Multiple workers
+-   [x] Graceful shutdown
+-   [x] Concurrent integration tests
 
 ### Phase 3 --- Leases and failure recovery
 
@@ -656,10 +788,11 @@ Key design decisions are recorded in `docs/adr/`:
 -   [0003 --- Fencing via the attempt counter](docs/adr/0003-fencing-via-attempt.md)
 -   [0004 --- Task lifecycle and execution model](docs/adr/0004-task-lifecycle-and-execution-model.md)
 
-ADRs 0002 and 0003 describe planned behavior, not what the code does
-today. ADR 0004's "Current implementation versus planned" section matches
-the code: the lifecycle writes, `TaskExecutor`, the worker pool, and the
-`/api/v1/tasks` API are in place.
+ADRs 0002 and 0003 are accepted targets. Their "Current implementation
+versus planned" notes say what the code does today: finish writes exist,
+and at-least-once recovery and the `attempt` fence do not. ADR 0004's
+current-implementation section matches the code, including
+`/api/v1/tasks`.
 
 ## Repository Structure
 
@@ -696,7 +829,7 @@ created all at once.
 
 ## Current Status
 
-**Milestone: M0 complete. M1.1 through M1.5 are in place.**
+**Milestone: M0 complete. M1 (M1.0 through M1.6) complete.**
 
 The system can currently create a task, store it in PostgreSQL, safely
 claim a pending task using PostgreSQL row locking, and complete, fail, or
@@ -713,6 +846,6 @@ run against Testcontainers. GitHub Actions runs `./mvnw verify`.
 Not built yet: attempts, leases, heartbeats, recovery of abandoned
 tasks, fencing, retries, and idempotency. A crash after claim, an
 interrupt during the handler, or a finish write that throws leaves the
-task `RUNNING`. ADR 0004 records the rest of the M1 model. The finish
-guards, the executor, the pool, and `/api/v1/tasks` in that ADR match
-the code. Docs and a curl demo that waits until a task finishes are M1.6.
+task `RUNNING`. The guarantees section and ADR 0004 are the limit of
+what M1 claims. Clients create a task with `curl` and read it until the
+status is terminal.

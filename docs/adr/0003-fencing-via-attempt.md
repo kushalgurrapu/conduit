@@ -4,9 +4,8 @@
 
 Accepted
 
-This is a **planned** decision. It is **not implemented**. The `tasks`
-table has no `attempt` column, claiming does not count attempts, and no
-write checks for a stale worker.
+This is a **planned** decision. The `attempt` fence is **not
+implemented**. See "Current implementation versus planned".
 
 ## Context
 
@@ -66,6 +65,22 @@ and the new execution would then look identical. The pair
 - **An external lock service**: adds infrastructure and still needs
   fencing at the write.
 
+## Current implementation versus planned
+
+**Implemented today:** complete and fail are one `UPDATE` whose `WHERE`
+is `id`, `status = 'RUNNING'`, and `worker_id`. Zero rows is a value on
+the worker path. The service classifies that result and does not retry
+the write.
+
+**Not implemented:** an `attempt` column, incrementing it on claim, and
+`AND attempt = :attempt` on worker writes. There is no lease.
+
+`worker_id` is the whole M1 fence. It is enough only while one loop is a
+single thread that never claims the same task again, and while nothing
+lets a second claim happen (ADR 0004). It does not reject a stale writer
+from a **later** claim that reuses the same `worker_id`. That rejection
+is this ADR, and it waits for M3.
+
 ## Consequences
 
 - Fencing is only as good as the database check. It is correct because
@@ -82,7 +97,9 @@ and the new execution would then look identical. The pair
 
 ## Future implications
 
-These are the milestones this decision constrains. None of it exists yet.
+These are the milestones this decision constrains. The `attempt` column
+and the lease still do not exist. Zero-row classification on complete
+and fail does (ADR 0004).
 
 - The lease milestone adds the `attempt` column and lease expiry. The claim
   statement then increments `attempt`, and heartbeats, completion, and
