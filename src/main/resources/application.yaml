@@ -27,10 +27,21 @@ engine:
     enabled: true
     concurrency: 4
     poll-interval: 1s
+    # Empty claims wait poll-interval, then twice that, until this cap.
+    # Equal jitter picks a duration from half of the current delay through
+    # the whole delay. A claim starts the sequence over. Must be at least
+    # poll-interval.
+    max-idle-interval: 30s
     error-backoff: 1s
     shutdown-timeout: 20s
 
 management:
+  endpoint:
+    health:
+      # workerPool is one component. Details include liveLoops and
+      # unexpectedExits. This process has no authentication yet.
+      show-components: always
+      show-details: always
   endpoints:
     web:
       exposure:

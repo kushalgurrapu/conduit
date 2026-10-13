@@ -95,13 +95,17 @@ on a duplicate handler type or a type that fails the task_type check.
 
 WorkerPool, when engine.worker.enabled is true, calls runOnce from a
 fixed number of platform threads (engine.worker.concurrency, default 4).
-Each loop has one worker id. An empty queue waits poll-interval. Shutdown
-stops new claims, finishes a task already claimed, and interrupts a
-handler still running at shutdown-timeout. That timeout must be shorter
-than spring.lifecycle.timeout-per-shutdown-phase. It is not a handler
+Each loop has one worker id. An empty queue waits a delay that starts at
+poll-interval and doubles up to max-idle-interval, with equal jitter.
+A claim resets that delay. Shutdown stops new claims, finishes a task
+already claimed, and interrupts a handler still running at
+shutdown-timeout. That timeout must be shorter than
+spring.lifecycle.timeout-per-shutdown-phase. It is not a handler
 timeout while the process is up. An interrupt leaves the task RUNNING.
-Hikari maximum-pool-size must be at least concurrency plus API headroom.
-Tests set engine.worker.enabled=false and build their own pool.
+A loop that exits from an Error stays dead; /actuator/health then
+reports the workerPool component DOWN. Hikari maximum-pool-size must
+be at least concurrency plus API headroom. Tests set
+engine.worker.enabled=false and build their own pool.
 
 Not implemented yet: attempt counter, leases, heartbeats, crash recovery,
 fencing, retries, idempotency, and workflow definitions. GitHub Actions
@@ -132,6 +136,19 @@ Verified:
   claimed work on shutdown without claiming more, leaves a handler
   interrupted at the deadline RUNNING, and does not finish a crashed
   claim (WorkerPoolTest)
+- Idle backoff doubles until max-idle-interval and resets after a claim
+  (IdleBackoffTest, WorkerPoolTest). Four loops complete 1,000 tasks
+  once each (WorkerPoolTest)
+- Worker-pool health is UP when workers are disabled, and UP when the
+  pool is running, no loop has exited unexpectedly, and liveLoops equals
+  concurrency. That equality is worker-loop readiness only: the loops
+  are inside run, including idle waits and database backoff. It does not
+  mean a handler is making progress, that the database is reachable, or
+  that tasks are being processed. The component is OUT_OF_SERVICE when
+  the pool is stopped or stopping, and when it is running with fewer
+  live loops than concurrency and no unexpected exit. It is DOWN when a
+  loop dies while the pool is still started (WorkerPoolTest,
+  WorkerPoolHealthIndicatorTest)
 - POST /api/v1/tasks returns 201 and Location. GET returns the task.
   Cancel of a pending task returns 200, cancel again stays 200, and
   cancel of a running task returns 409 and leaves the row RUNNING
