@@ -373,7 +373,8 @@ M1 does not provide, and this document does not claim:
 -   that a returned outcome always commits (`RUNNING` after a failed
     finish write is allowed)
 -   rejection of a stale writer from a **later** claim that reuses the
-    same `worker_id` (that is ADR 0003, via `attempt`, in M3)
+    same `worker_id`. The `attempt` guard is M3 (ADR 0003). A later
+    claim exists only after M4 recovery
 -   handler timeouts or detection of a hung worker
 -   task-level retries
 
@@ -667,8 +668,8 @@ Done in M0:
 -   package renamed to `com.kushal.workflow`
 -   `V3__task_hardening.sql` (`timestamptz`, `updated_at`, status
     `CHECK`, partial index for pending tasks) and `Instant` in Java
--   one shared Testcontainers PostgreSQL instance for all integration
-    tests
+-   one shared Testcontainers PostgreSQL instance for the Spring tests
+    (`V4MigrationTest` uses the same server and its own database)
 -   a deterministic test that fails if `SKIP LOCKED` is removed
 -   `docker-compose.yml` and environment-based datasource settings
 -   `.gitattributes` line-ending normalization
@@ -688,11 +689,14 @@ finish write. M1.4 added `WorkerPool`. M1.5 added `/api/v1/tasks`
 (create, get, cancel). M1.6 is this documentation and the curl demo.
 Complete and fail stay on the worker. They are not HTTP operations.
 
-Leases and failure recovery are M3 and M4. They are not part of M1.
+The next milestone is M3, leases and heartbeats. Crash recovery is M4.
+Neither is part of M1.
 
 ## Planned Development Order
 
-The project should progress roughly in this order:
+The project should progress roughly in this order. Phase headings
+below are a learning outline. Milestone ids live in `PROJECT_ROADMAP.md`.
+The next milestone is M3. M4 is the following one, not part of M3.
 
 ### Phase 1 --- Task claiming
 
@@ -718,14 +722,22 @@ The project should progress roughly in this order:
 -   [x] Graceful shutdown
 -   [x] Concurrent integration tests
 
-### Phase 3 --- Leases and failure recovery
+### Phase 3 --- Leases, then crash recovery
+
+These checkboxes are two milestones. Do not treat the phase as one
+implementation. The ids are in `PROJECT_ROADMAP.md`.
+
+M3, leases and heartbeats (next; not started):
 
 -   [ ] Task lease expiration
 -   [ ] Heartbeats
+-   [ ] `attempt` incremented on claim and checked on worker writes
+
+M4, crash recovery and the fencing proof (after M3):
+
 -   [ ] Worker crash simulation
 -   [ ] Recovery of abandoned tasks
--   [ ] Prevent stale workers from modifying tasks
--   [ ] Fencing
+-   [ ] Prevent a stale attempt from modifying a task a later claim owns
 
 ### Phase 4 --- Retries and idempotency
 
@@ -762,6 +774,10 @@ Important principle:
 -   [ ] Concurrency limits
 
 ### Phase 7 --- Observability
+
+`workerPool` on `/actuator/health` and MDC keys `taskId`, `workerId`, and
+`taskType` already exist. They are not this phase. Milestone M11 is the
+rest:
 
 -   [ ] Structured logging
 -   [ ] Metrics
@@ -882,7 +898,7 @@ created all at once.
 
 ## Current Status
 
-**Milestone: M0 complete. M1 (M1.0 through M1.6) complete.**
+**Milestone: M0 complete. M1 complete, including former M2 and the idle-backoff and worker-pool health work. Next milestone: M3 (leases and heartbeats). M4 (crash recovery) comes after M3.**
 
 The system can currently create a task, store it in PostgreSQL, safely
 claim a pending task using PostgreSQL row locking, and complete, fail, or

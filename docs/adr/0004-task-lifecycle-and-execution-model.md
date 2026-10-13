@@ -394,8 +394,9 @@ progress. That is a lost task, not at-least-once execution (ADR 0002).
 - M3 adds `attempt` on the claim statement and on the finish guard, and
   replaces `tasks_running_has_owner_check` with one check that also
   requires the lease. It does not add a second overlapping check.
-  Cooperative cancel of a `RUNNING` task, and any handler timeout, also
-  wait until M3.
+  The cooperative cancel in M3 is the in-process signal when a heartbeat
+  is rejected. It does not change `POST /api/v1/tasks/{id}/cancel`, which
+  stays `409` for `RUNNING`. There is still no wall-clock handler timeout.
 - When M4's reaper returns a task to `PENDING`, it must clear
   `worker_id`, `lease_expires_at`, and `claimed_at`. A `PENDING` row that
   still has an owner would violate `tasks_pending_has_no_owner_check`.

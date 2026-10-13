@@ -67,7 +67,7 @@ Current implementation:
 - The claim update re-checks status PENDING, and sets worker_id, claimed_at,
   and updated_at (claimed_at and updated_at share the same now())
 - A null worker id is rejected before the claim write
-- Claim returns the updated Task
+- Claim returns the updated Task, or null when no pending row is available
 - Task.status is a TaskStatus enum. isTerminal() is the only method.
   Transitions are not decided in Java
 - complete, fail, and cancel are one UPDATE each. The WHERE clause is
@@ -156,37 +156,93 @@ Verified:
   A bad type, JSON null, a NUL byte, and unreadable JSON are 400
   ProblemDetail. A missing id is 404. A database error is a generic 500
 
+Source of truth:
+
+- Code and tests override every document.
+- Milestone order and the next milestone: `PROJECT_ROADMAP.md`, section
+  "Current state (verified 2026-10-12)". Section 0 of that file is the
+  2026-10-02 audit. It still mentions `POST /tasks` and a placeholder
+  `TaskWorker`. Those are gone.
+- Lifecycle rules: `docs/adr/0004-task-lifecycle-and-execution-model.md`.
+- `.plans/` is gitignored. The M1 plan there is finished historical
+  material. A fresh clone will not contain it. Do not implement from it.
+
 Current milestone:
 
-M0 (foundation hardening) is complete, including GitHub Actions CI.
-See PROJECT_ROADMAP.md.
+M0 is complete, including GitHub Actions CI.
 
-M1 is complete (M1.0 through M1.6): task lifecycle, the REST API, and the
-worker runtime. Roadmap M2 is merged into M1. Those decisions are recorded
-in ADR 0004 and in the roadmap deviations table. Implemented: the task
-record, TaskStatus, Flyway V4, guarded complete, fail, and cancel,
-TaskExecutor (claim, handler, one finish write), WorkerPool, and
-`/api/v1/tasks` (create, get, cancel). The README states the M1 guarantees
-and the known limitations, including stuck RUNNING, legacy rows, kill -9
-versus a host crash, owner-pinned manual requeue, and that RUNNING is not
-"currently executing".
+M1 is complete, including former roadmap M2 (the worker runtime) and the
+later idle-backoff and `workerPool` health work. Do not rebuild the task
+API, the executor, the pool, idle backoff, or the health indicator.
 
-After M1:
+Next milestone is M3, leases and heartbeats. It is not started. There is
+no `attempt` column, no `lease_expires_at`, and no heartbeat.
 
-- leases
-- crash recovery
-- fencing
-- retries
-- idempotency
-- workflow state machine
-- scheduling/fairness
-- observability
+M3 includes: set a lease and increment `attempt` on claim; extend the
+lease for the owning worker and attempt; abort the handler in-process
+when an extension fails; put `attempt` on `completeTask` and `failTask`;
+replace `tasks_running_has_owner_check` with one check that also requires
+the lease; add `attempt` and `leaseExpiresAt` to `TaskResponse`. The next
+migration is V5. Do not edit V1–V4.
 
-Design decisions are recorded in docs/adr/. ADRs 0002 (at-least-once) and
-0003 (fencing via attempt) are accepted targets. Their current-implementation
-notes match the code: finish writes exist, and recovery and the attempt
-fence do not. ADR 0004's current-implementation section matches the code
-through `/api/v1/tasks`.
+M3 does not include: the reaper, any engine path from `RUNNING` back to
+`PENDING`, crash or zombie tests, retries, idempotency, workflows, a
+wall-clock handler timeout, or changing cancel so a `RUNNING` task
+succeeds. Cancel of `RUNNING` stays `409`. Requiring
+`lease_expires_at > now()` on complete or fail is M4. At-least-once
+recovery is M4 (ADR 0002). The attempt fence is introduced in M3 and
+proved against a later claim in M4 (ADR 0003).
+
+Acceptance criteria and the explicit out-of-scope list are in the M3
+"Start here" block in `PROJECT_ROADMAP.md`.
+
+Numbering was not changed in the 2026-10-12 reconciliation. From the
+first committed roadmap, M2 was the worker runtime (later merged into
+M1), M3 was leases and heartbeats, and M4 was crash recovery and fencing.
+No committed roadmap defines M2 as leases. README phase headings are not
+milestone ids.
+
+Later, after M3 and M4: retries (M5), idempotency (M6), workflow runs
+(M7), then the rest of `PROJECT_ROADMAP.md`. Do not start those inside M3.
+
+Design decisions are recorded in `docs/adr/`. ADRs 0002 and 0003 are
+accepted targets. Their current-implementation notes match the code:
+finish writes exist, and recovery and the attempt fence do not. ADR
+0004's current-implementation section matches the code, including idle
+backoff and `workerPool` health.
+
+Packages:
+
+- `api`: `TaskController`, `CreateTaskRequest`, `TaskResponse`,
+  `TaskPayloadValidator`, `ApiExceptionHandler`,
+  `IllegalTaskTransitionException`
+- `task`: `Task`, `TaskStatus`, `TaskService`, `TaskRepository`,
+  `TransitionResult`, `CancelResult`, `TaskNotFoundException`
+- `worker`: `WorkerPool`, `WorkerProperties`, `IdleBackoff`,
+  `WorkerPoolHealthIndicator`, `TaskExecutor`, `HandlerConfiguration`,
+  `TaskHandler`, `TaskContext`, `TaskOutcome`, and the `NOOP`, `ECHO`,
+  `FAIL`, and `SLEEP` handlers
+
+Inspect those, plus `application.yaml` and `src/main/resources/db/migration`,
+before changing behavior. There is one controller. Claim, complete, and
+fail are not HTTP operations.
+
+Tests:
+
+```text
+.\mvnw.cmd -B verify
+```
+
+Use `./mvnw -B verify` off Windows. Docker must be running for
+Testcontainers. The Compose database is not required. Spring tests extend
+`PostgresIntegrationTest`: one shared PostgreSQL container, workers
+disabled, `DELETE FROM tasks` before each test. `V4MigrationTest` uses
+its own database and does not start the Spring context. Do not turn the
+shared application pool on inside those tests.
+
+A worker-loop exception that is not a database or transaction failure is
+logged and the loop continues with no `error-backoff`. That is current
+behavior. It does not block M3, and M3 should not be widened to "fix" it.
 
 
 
