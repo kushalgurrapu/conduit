@@ -338,10 +338,17 @@ invocations.
   loop has one UUID for its lifetime and a thread name
   `host-pid-loopN`. The loop calls `runOnce`. It reads the stop flag
   only before that call, so a task already claimed is still executed.
-  An empty claim waits `poll-interval` on a latch that shutdown opens.
-  `DataAccessException` and `TransactionException` are logged, then the
-  loop waits `error-backoff` and continues. Any other `Exception` is
-  logged and the loop continues. An `Error` kills that loop only.
+  An empty claim waits on a latch that shutdown opens. The wait starts
+  at `poll-interval` and doubles for each consecutive empty claim, up
+  to `max-idle-interval` (default 30s, and at least `poll-interval`).
+  Equal jitter chooses a duration from half of that delay through the
+  full delay. A claim resets the count. `error-backoff` is a fixed wait
+  and is not jittered. `DataAccessException` and `TransactionException`
+  are logged, then the loop waits `error-backoff` and continues. Any
+  other `Exception` is logged and the loop continues. An `Error` kills
+  that loop only. The pool stays running, the other loops keep
+  claiming, and the `workerPool` health component goes `DOWN`. Nothing
+  replaces the dead loop.
 - Shutdown sets the stop flag, wakes idle loops, and waits
   `shutdown-timeout` (default 20s). That duration must be shorter than
   `spring.lifecycle.timeout-per-shutdown-phase` (Boot default 30s). It
@@ -359,8 +366,10 @@ invocations.
 
 The named checks hold. The finish guards hold. `TaskExecutorTest` covers
 one finish attempt, no connection during execute, and interruption left
-as `RUNNING`. `WorkerPoolTest` covers the concurrency cap and the stop
-behavior. A crash after claim leaves the task `RUNNING` with no further
+as `RUNNING`. `WorkerPoolTest` covers the concurrency cap, the stop
+behavior, idle-backoff reset, the 1,000-task soak, and worker-pool
+health. `IdleBackoffTest` covers the delay bounds. A crash after claim
+leaves the task `RUNNING` with no further
 progress. That is a lost task, not at-least-once execution (ADR 0002).
 
 ## Consequences

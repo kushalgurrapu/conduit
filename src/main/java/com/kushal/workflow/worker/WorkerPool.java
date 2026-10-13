@@ -3,6 +3,7 @@ package com.kushal.workflow.worker;
 import com.kushal.workflow.task.TaskRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.context.LifecycleProperties;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.dao.DataAccessException;
@@ -19,6 +20,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.random.RandomGenerator;
 
 /**
  * Pulls work on a fixed number of platform threads.
@@ -26,6 +29,12 @@ import java.util.concurrent.TimeUnit;
  * <p>Each loop calls {@link TaskExecutor#runOnce} for one task at a time.
  * The loop checks {@link #stopping} only before that call. A task that has
  * already been claimed is executed even if shutdown has started.
+ *
+ * <p>An empty claim waits on a latch that {@link #stop()} opens. The
+ * wait starts at {@code poll-interval} and doubles while the queue stays
+ * empty, up to {@code max-idle-interval}, with equal jitter
+ * ({@link IdleBackoff}). A claim clears that count. A database error
+ * still waits the fixed {@code error-backoff}.
  *
  * <p>{@link #stop()} runs before singleton destruction closes the
  * datasource. {@code shutdown-timeout} must be shorter than
@@ -40,6 +49,7 @@ public class WorkerPool implements SmartLifecycle {
     private final TaskExecutor taskExecutor;
     private final WorkerProperties properties;
     private final TaskRepository taskRepository;
+    private final IdleBackoff idleBackoff;
 
     /**
      * Start and stop share this lock, including the wait inside
@@ -52,15 +62,44 @@ public class WorkerPool implements SmartLifecycle {
     private volatile CountDownLatch stopLatch = new CountDownLatch(1);
     private volatile ExecutorService pool;
     private volatile List<UUID> workerIds = List.of();
+    private volatile int loopGeneration;
+    private final AtomicInteger liveLoops = new AtomicInteger();
+    private final AtomicInteger unexpectedExits = new AtomicInteger();
 
+    @Autowired
     public WorkerPool(
             TaskExecutor taskExecutor,
             WorkerProperties properties,
             TaskRepository taskRepository,
             LifecycleProperties lifecycleProperties) {
+        this(
+                taskExecutor,
+                properties,
+                taskRepository,
+                lifecycleProperties,
+                idleBackoff(properties, lifecycleProperties));
+    }
+
+    private static IdleBackoff idleBackoff(
+            WorkerProperties properties, LifecycleProperties lifecycleProperties) {
+        properties.validate(lifecycleProperties.getTimeoutPerShutdownPhase());
+        return new IdleBackoff(properties.getPollInterval(), properties.getMaxIdleInterval());
+    }
+
+    /**
+     * Tests pass their own {@link IdleBackoff} to record miss counts.
+     * The public constructor builds one from {@code engine.worker.*}.
+     */
+    WorkerPool(
+            TaskExecutor taskExecutor,
+            WorkerProperties properties,
+            TaskRepository taskRepository,
+            LifecycleProperties lifecycleProperties,
+            IdleBackoff idleBackoff) {
         this.taskExecutor = taskExecutor;
         this.properties = properties;
         this.taskRepository = taskRepository;
+        this.idleBackoff = idleBackoff;
         properties.validate(lifecycleProperties.getTimeoutPerShutdownPhase());
     }
 
@@ -76,6 +115,9 @@ public class WorkerPool implements SmartLifecycle {
             }
             stopping = false;
             stopLatch = new CountDownLatch(1);
+            int generation = ++loopGeneration;
+            liveLoops.set(0);
+            unexpectedExits.set(0);
             int concurrency = properties.getConcurrency();
             String namePrefix = hostName() + "-" + ProcessHandle.current().pid();
             List<UUID> ids = new ArrayList<>(concurrency);
@@ -85,7 +127,7 @@ public class WorkerPool implements SmartLifecycle {
                     UUID workerId = UUID.randomUUID();
                     ids.add(workerId);
                     String threadName = namePrefix + "-loop" + i;
-                    created.execute(new Loop(workerId, threadName));
+                    created.execute(new Loop(workerId, threadName, generation));
                 }
             } catch (RuntimeException ex) {
                 stopping = true;
@@ -137,6 +179,19 @@ public class WorkerPool implements SmartLifecycle {
     /** Package-private so a test can see that shutdown has begun. */
     boolean isStopping() {
         return stopping;
+    }
+
+    /** Loops inside {@code run}, including those waiting on an empty queue. */
+    int liveLoopCount() {
+        return liveLoops.get();
+    }
+
+    /**
+     * Loops that left {@code run} while this pool was still started.
+     * Shutdown exits are not counted.
+     */
+    int unexpectedExitCount() {
+        return unexpectedExits.get();
     }
 
     @Override
@@ -201,10 +256,14 @@ public class WorkerPool implements SmartLifecycle {
 
         private final UUID workerId;
         private final String threadName;
+        private final int generation;
+        private final RandomGenerator random = RandomGenerator.of("L32X64MixRandom");
+        private int consecutiveMisses;
 
-        private Loop(UUID workerId, String threadName) {
+        private Loop(UUID workerId, String threadName, int generation) {
             this.workerId = workerId;
             this.threadName = threadName;
+            this.generation = generation;
         }
 
         @Override
@@ -212,12 +271,20 @@ public class WorkerPool implements SmartLifecycle {
             Thread.currentThread().setName(threadName);
             log.info("Worker loop {} started", workerId);
             try {
+                liveLoops.incrementAndGet();
                 // stopping is read here, then runOnce claims and executes
-                // without looking at it again.
-                while (!stopping && !Thread.currentThread().isInterrupted()) {
+                // without looking at it again. A later start() bumps
+                // loopGeneration so a handler that outlived the previous
+                // stop does not claim on the new generation.
+                while (!stopping
+                        && generation == loopGeneration
+                        && !Thread.currentThread().isInterrupted()) {
                     try {
                         if (!taskExecutor.runOnce(workerId)) {
-                            pause(properties.getPollInterval());
+                            consecutiveMisses++;
+                            pause(idleBackoff.delayAfterMiss(consecutiveMisses, random));
+                        } else {
+                            consecutiveMisses = 0;
                         }
                     } catch (InterruptedException ex) {
                         break;
@@ -238,6 +305,13 @@ public class WorkerPool implements SmartLifecycle {
                     // An Error leaves this method. That loop is dead.
                 }
             } finally {
+                if (generation == loopGeneration) {
+                    liveLoops.decrementAndGet();
+                    if (!stopping) {
+                        unexpectedExits.incrementAndGet();
+                        log.warn("Worker loop {} exited while the pool was still running", workerId);
+                    }
+                }
                 log.info("Worker loop {} stopped", workerId);
             }
         }

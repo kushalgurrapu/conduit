@@ -29,6 +29,15 @@ public class WorkerProperties {
     @NotNull
     private Duration pollInterval = Duration.ofSeconds(1);
 
+    /**
+     * Cap for the idle wait. Each consecutive empty claim doubles
+     * {@link #pollInterval} until this value. Equal jitter then picks a
+     * duration from half of that delay through the whole delay. Must be
+     * at least {@link #pollInterval}.
+     */
+    @NotNull
+    private Duration maxIdleInterval = Duration.ofSeconds(30);
+
     @NotNull
     private Duration errorBackoff = Duration.ofSeconds(1);
 
@@ -40,6 +49,12 @@ public class WorkerProperties {
             throw new IllegalStateException("engine.worker.concurrency must be at least 1");
         }
         requirePositive(pollInterval, "poll-interval");
+        requirePositive(maxIdleInterval, "max-idle-interval");
+        if (maxIdleInterval.compareTo(pollInterval) < 0) {
+            throw new IllegalStateException(
+                    "engine.worker.max-idle-interval (" + maxIdleInterval
+                            + ") must be at least poll-interval (" + pollInterval + ")");
+        }
         requirePositive(errorBackoff, "error-backoff");
         requirePositive(shutdownTimeout, "shutdown-timeout");
         if (phaseTimeout == null || phaseTimeout.isZero() || phaseTimeout.isNegative()) {
@@ -82,6 +97,14 @@ public class WorkerProperties {
 
     public void setPollInterval(Duration pollInterval) {
         this.pollInterval = pollInterval;
+    }
+
+    public Duration getMaxIdleInterval() {
+        return maxIdleInterval;
+    }
+
+    public void setMaxIdleInterval(Duration maxIdleInterval) {
+        this.maxIdleInterval = maxIdleInterval;
     }
 
     public Duration getErrorBackoff() {

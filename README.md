@@ -244,9 +244,19 @@ WHERE id = :id
 write. `WorkerPool` calls it from a fixed number of platform threads
 (`engine.worker.concurrency`, default 4) when `engine.worker.enabled`
 is true. Each loop has its own worker id for as long as it lives, and
-the thread is named `host-pid-loopN`. An empty queue waits
-`engine.worker.poll-interval` and then tries again. A loop does not
-pick up a second task while one is still running.
+the thread is named `host-pid-loopN`. An empty queue waits, then
+tries again. A loop does not pick up a second task while one is still
+running.
+
+The idle wait starts at `poll-interval` and doubles on each consecutive
+empty claim, up to `max-idle-interval`. Equal jitter picks a duration
+from half of that delay through the whole delay, so loops that found
+nothing together do not wake on the same tick, and the wait cannot
+collapse into a spin. A claim clears the miss count, so the next idle
+wait is short again. Shutdown opens the latch and ends the wait.
+`error-backoff` stays a fixed wait after a database or transaction
+error. A task created while every loop is already at the cap is claimed
+within `max-idle-interval`.
 
 `engine.worker` settings, with the defaults from `application.yaml`:
 
@@ -255,10 +265,12 @@ pick up a second task while one is still running.
 -   `concurrency` (`4`): platform-thread loops. In-flight handlers never
     exceed this number. Each loop pulls one task at a time and does not
     prefetch.
--   `poll-interval` (`1s`): how long an idle loop waits before claiming
-    again.
--   `error-backoff` (`1s`): wait after a database or transaction error,
-    then keep looping.
+-   `poll-interval` (`1s`): the base idle delay. The first empty claim
+    waits between half of this and the full value.
+-   `max-idle-interval` (`30s`): the cap for that delay. It must be at
+    least `poll-interval`.
+-   `error-backoff` (`1s`): fixed wait after a database or transaction
+    error, then the loop continues.
 -   `shutdown-timeout` (`20s`): how long shutdown waits for work already
     claimed before interrupting it. This must be shorter than
     `spring.lifecycle.timeout-per-shutdown-phase` (30 seconds unless
@@ -269,6 +281,31 @@ On shutdown the pool stops claiming, then waits `shutdown-timeout`. A
 task already claimed is still executed. If a handler is still going when
 the wait ends, it is interrupted and left `RUNNING` when it honors the
 interrupt.
+
+`/actuator/health` includes a `workerPool` component.
+`application.yaml` sets `show-components` and `show-details` to
+`always`, and the endpoint is unauthenticated. The component is `UP`
+when workers are disabled. It is `UP` when the pool is running, no
+loop has exited unexpectedly, and `liveLoops` equals `concurrency`.
+That match means every configured loop is inside `run`, including a
+loop waiting on an empty queue or backing off after a database error.
+It is worker-loop readiness only. It does not mean a handler is making
+progress, that the database is reachable, or that tasks are being
+processed.
+
+It is `OUT_OF_SERVICE` when workers are enabled and the pool is
+stopped or stopping, including a normal shutdown. It is also
+`OUT_OF_SERVICE` when the pool is running and `liveLoops` is still
+below `concurrency` with no unexpected exit. `start` reports running
+after the loops are submitted, and each loop increments `liveLoops`
+when it enters `run`. A loop that dies decrements `liveLoops` before
+it increments `unexpectedExits`, so one sample can report
+`OUT_OF_SERVICE` and the next `DOWN`.
+
+It is `DOWN` when a loop leaves `run` while the pool is still started
+and not stopping. The other loops keep pulling. Nothing starts a
+replacement. Details include `enabled`, `running`, `stopping`,
+`concurrency`, `liveLoops`, and `unexpectedExits`.
 
 Hikari `maximum-pool-size` (default 10) must be at least
 `engine.worker.concurrency` plus headroom for API requests. A handler
@@ -368,6 +405,11 @@ are second invocations.
     claimed and has not finished. The handler may be running, may have
     crashed, may have been interrupted, or may have returned an outcome
     whose finish write did not commit.
+-   **A dead loop stays dead.** An `Error` from a loop is logged and
+    that thread ends. The pool's lifecycle flag stays running, and
+    `/actuator/health` reports `workerPool` as `DOWN`. The remaining
+    loops keep pulling. Nothing starts a replacement thread. Restart
+    the process to get the configured concurrency back.
 
 ## Database
 
@@ -541,7 +583,18 @@ This allows multiple workers to make progress concurrently.
     claim anything new. A handler still blocked at
     `shutdown-timeout` is left `RUNNING` with its worker id. A row
     claimed by hand and never finished stays `RUNNING` while a later
-    task completes.
+    task completes. The same class runs 1,000 `COUNT` tasks on four
+    loops and checks that each completed once. Empty claims pass miss
+    counts 1, 2, 3, and a claim starts that count over at 1. Health is
+    `UP` when the application pool is disabled, `UP` when a test pool
+    is running and every loop is live, `OUT_OF_SERVICE` after stop,
+    and `DOWN` when a loop throws `Error` and the pool still reports
+    running. `WorkerPoolHealthIndicatorTest` checks the rest of the
+    status table without a database, including a started pool whose
+    loops are not all live yet.
+-   `IdleBackoffTest` checks that the idle delay doubles until
+    `max-idle-interval` and that equal jitter stays inside half of the
+    current delay through the whole delay.
 
 All of the Spring tests extend `PostgresIntegrationTest`, which uses one
 shared Testcontainers PostgreSQL container, deletes every task before

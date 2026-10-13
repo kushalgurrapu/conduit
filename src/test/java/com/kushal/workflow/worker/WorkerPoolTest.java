@@ -11,6 +11,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.context.LifecycleProperties;
+import org.springframework.boot.health.actuate.endpoint.CompositeHealthDescriptor;
+import org.springframework.boot.health.actuate.endpoint.HealthDescriptor;
+import org.springframework.boot.health.actuate.endpoint.HealthEndpoint;
+import org.springframework.boot.health.contributor.Health;
+import org.springframework.boot.health.contributor.Status;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
@@ -19,10 +24,12 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.random.RandomGenerator;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -32,6 +39,7 @@ import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -71,6 +79,15 @@ class WorkerPoolTest extends PostgresIntegrationTest {
 
     @Autowired
     private LatchHandler latchHandler;
+
+    @Autowired
+    private WorkerPoolHealthIndicator applicationHealth;
+
+    @Autowired
+    private WorkerProperties applicationProperties;
+
+    @Autowired
+    private HealthEndpoint healthEndpoint;
 
     private WorkerPool pool;
 
@@ -271,6 +288,126 @@ class WorkerPoolTest extends PostgresIntegrationTest {
         assertNotEquals(crashedWorker, require(sentinel.id()).workerId());
     }
 
+    @Test
+    void idleMissesGrowAndResetAfterAClaim() throws Exception {
+        WorkerProperties workerProperties = properties(
+                1, Duration.ofMillis(50), Duration.ofSeconds(2), Duration.ofMillis(20));
+        RecordingBackoff backoff = new RecordingBackoff(
+                workerProperties.getPollInterval(), workerProperties.getMaxIdleInterval());
+        pool = new WorkerPool(
+                new ScriptedExecutor(false, false, false, true, false),
+                workerProperties,
+                taskRepository,
+                new LifecycleProperties(),
+                backoff);
+        pool.start();
+        awaitTrue(() -> backoff.size() >= 4, "idle misses were not recorded");
+        pool.stop();
+        pool = null;
+        assertEquals(List.of(1, 2, 3, 1), backoff.prefix(4));
+    }
+
+    @Test
+    void disabledApplicationPoolIsUp() {
+        assertFalse(applicationProperties.isEnabled());
+        Health health = applicationHealth.health();
+        assertEquals(Status.UP, health.getStatus());
+        assertEquals(false, health.getDetails().get("enabled"));
+        assertEquals(false, health.getDetails().get("running"));
+        assertEquals(false, health.getDetails().get("stopping"));
+        assertEquals(0, health.getDetails().get("liveLoops"));
+        assertEquals(0, health.getDetails().get("unexpectedExits"));
+
+        HealthDescriptor root = healthEndpoint.health();
+        assertEquals(Status.UP, root.getStatus());
+        CompositeHealthDescriptor composite = assertInstanceOf(CompositeHealthDescriptor.class, root);
+        HealthDescriptor component = composite.getComponents().get("workerPool");
+        assertNotNull(component, composite.getComponents().keySet().toString());
+        assertEquals(Status.UP, component.getStatus());
+    }
+
+    @Test
+    void runningPoolIsUpAndStoppedPoolIsOutOfService() throws Exception {
+        WorkerProperties workerProperties = properties(
+                1, Duration.ofHours(1), Duration.ofSeconds(5), Duration.ofSeconds(1));
+        pool = new WorkerPool(
+                new IdleExecutor(), workerProperties, taskRepository, new LifecycleProperties());
+        WorkerPoolHealthIndicator health = new WorkerPoolHealthIndicator(pool, workerProperties);
+        pool.start();
+        awaitTrue(() -> pool.liveLoopCount() == 1, "the loop did not start");
+
+        Health up = health.health();
+        assertEquals(Status.UP, up.getStatus());
+        assertEquals(true, up.getDetails().get("enabled"));
+        assertEquals(true, up.getDetails().get("running"));
+        assertEquals(false, up.getDetails().get("stopping"));
+        assertEquals(1, up.getDetails().get("concurrency"));
+        assertEquals(1, up.getDetails().get("liveLoops"));
+        assertEquals(0, up.getDetails().get("unexpectedExits"));
+
+        pool.stop();
+        Health stopped = health.health();
+        assertEquals(Status.OUT_OF_SERVICE, stopped.getStatus());
+        assertEquals(false, stopped.getDetails().get("running"));
+        assertEquals(true, stopped.getDetails().get("stopping"));
+        assertEquals(0, stopped.getDetails().get("liveLoops"));
+        assertEquals(0, pool.unexpectedExitCount());
+    }
+
+    @Test
+    void deadLoopIsDownWhileThePoolStillReportsRunning() throws Exception {
+        WorkerProperties workerProperties = properties(
+                1, Duration.ofHours(1), Duration.ofSeconds(2), Duration.ofSeconds(1));
+        pool = new WorkerPool(
+                new BrokenExecutor(), workerProperties, taskRepository, new LifecycleProperties());
+        WorkerPoolHealthIndicator health = new WorkerPoolHealthIndicator(pool, workerProperties);
+        pool.start();
+        awaitTrue(() -> pool.unexpectedExitCount() == 1, "the loop did not exit");
+
+        assertEquals(0, pool.liveLoopCount());
+        assertTrue(pool.isRunning());
+        assertFalse(pool.isStopping());
+        Health down = health.health();
+        assertEquals(Status.DOWN, down.getStatus());
+        assertEquals(1, down.getDetails().get("unexpectedExits"));
+        assertEquals(0, down.getDetails().get("liveLoops"));
+        assertEquals(true, down.getDetails().get("running"));
+    }
+
+    @Test
+    @Timeout(value = 3, unit = TimeUnit.MINUTES)
+    void oneThousandTasksEachCompleteOnce() throws Exception {
+        List<UUID> ids = jdbcClient.sql("""
+                INSERT INTO tasks (id, task_type, status, payload)
+                SELECT gen_random_uuid(), 'COUNT', 'PENDING', '{}'::jsonb
+                FROM generate_series(1, 1000)
+                RETURNING id
+                """)
+                .query((rs, rowNum) -> rs.getObject("id", UUID.class))
+                .list();
+        assertEquals(1000, ids.size());
+
+        pool = newPool(
+                DRAIN_CONCURRENCY, Duration.ofMillis(20), Duration.ofSeconds(20), Duration.ofMillis(50));
+        pool.start();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+        while (completedCount() != 1000) {
+            if (System.nanoTime() >= deadline) {
+                fail("expected 1000 completed tasks, saw " + completedCount()
+                        + ", executions " + countHandler.totalExecutions());
+            }
+            Thread.sleep(50);
+        }
+
+        assertEquals(0L, jdbcClient.sql("SELECT count(*) FROM tasks WHERE status <> 'COMPLETED'")
+                .query(Long.class)
+                .single());
+        assertEquals(1000, countHandler.totalExecutions());
+        for (UUID id : ids) {
+            assertEquals(1, countHandler.executions(id), id.toString());
+        }
+    }
+
     private WorkerPool newPool(
             int concurrency, Duration pollInterval, Duration shutdownTimeout, Duration errorBackoff) {
         return new WorkerPool(
@@ -286,9 +423,16 @@ class WorkerPoolTest extends PostgresIntegrationTest {
         properties.setEnabled(true);
         properties.setConcurrency(concurrency);
         properties.setPollInterval(pollInterval);
+        properties.setMaxIdleInterval(pollInterval);
         properties.setShutdownTimeout(shutdownTimeout);
         properties.setErrorBackoff(errorBackoff);
         return properties;
+    }
+
+    private long completedCount() {
+        return jdbcClient.sql("SELECT count(*) FROM tasks WHERE status = 'COMPLETED'")
+                .query(Long.class)
+                .single();
     }
 
     private void awaitTrue(BooleanSupplier condition, String message) throws InterruptedException {
@@ -452,6 +596,78 @@ class WorkerPoolTest extends PostgresIntegrationTest {
                 throw new DataAccessResourceFailureException("down");
             }
             return false;
+        }
+    }
+
+    /** Returns the scripted results, then keeps reporting an empty queue. */
+    static final class ScriptedExecutor extends TaskExecutor {
+
+        private final boolean[] results;
+        private final AtomicInteger calls = new AtomicInteger();
+
+        private ScriptedExecutor(boolean... results) {
+            super(null, Map.of(), null);
+            this.results = results;
+        }
+
+        @Override
+        public boolean runOnce(UUID workerId) {
+            int n = calls.getAndIncrement();
+            if (n >= results.length) {
+                return false;
+            }
+            return results[n];
+        }
+    }
+
+    /** Empty queue. The loop waits instead of claiming. */
+    static final class IdleExecutor extends TaskExecutor {
+
+        private IdleExecutor() {
+            super(null, Map.of(), null);
+        }
+
+        @Override
+        public boolean runOnce(UUID workerId) {
+            return false;
+        }
+    }
+
+    /** An {@code Error} kills the loop and leaves the pool running. */
+    static final class BrokenExecutor extends TaskExecutor {
+
+        private BrokenExecutor() {
+            super(null, Map.of(), null);
+        }
+
+        @Override
+        public boolean runOnce(UUID workerId) {
+            throw new Error("worker loop failed");
+        }
+    }
+
+    static final class RecordingBackoff extends IdleBackoff {
+
+        private final List<Integer> misses = Collections.synchronizedList(new ArrayList<>());
+
+        private RecordingBackoff(Duration base, Duration cap) {
+            super(base, cap);
+        }
+
+        int size() {
+            return misses.size();
+        }
+
+        List<Integer> prefix(int count) {
+            synchronized (misses) {
+                return List.copyOf(misses.subList(0, count));
+            }
+        }
+
+        @Override
+        Duration delayAfterMiss(int consecutiveMisses, RandomGenerator random) {
+            misses.add(consecutiveMisses);
+            return Duration.ofMillis(5);
         }
     }
 }
