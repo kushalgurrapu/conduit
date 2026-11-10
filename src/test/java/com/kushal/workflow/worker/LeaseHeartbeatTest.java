@@ -342,7 +342,7 @@ class LeaseHeartbeatTest {
         private volatile ExtendStep step = () -> true;
 
         private ScriptedTaskService(ManualScheduler scheduler) {
-            super(null, new LeaseProperties());
+            super(null, null, new LeaseProperties());
             this.scheduler = scheduler;
         }
 

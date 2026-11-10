@@ -1,26 +1,40 @@
 package com.kushal.workflow.task;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 /**
  * Transaction boundary for claim, lease extension, complete, fail, and cancel.
  *
- * <p>Each write is a single statement. Call this bean (the Spring proxy).
- * A direct self-call would skip the transaction, so the update and the
- * follow-up read would not stay on one connection.
+ * <p>Each write to {@code tasks} is a single statement. Claim and an applied
+ * complete or fail add one {@code task_attempts} statement in the same
+ * transaction. {@code tasks} is the source of truth and {@code task_attempts}
+ * records it: a history write that cannot be made is logged at WARN, and the
+ * {@code tasks} change still commits. Call this bean (the Spring proxy).
+ * A direct self-call would skip the transaction, so the update, its history
+ * write, and the follow-up read would not stay on one connection.
  */
 @Service
 public class TaskService {
 
+    private static final Logger log = LoggerFactory.getLogger(TaskService.class);
+
     private final TaskRepository taskRepository;
+    private final TaskAttemptRepository taskAttemptRepository;
     private final LeaseProperties leaseProperties;
 
-    public TaskService(TaskRepository taskRepository, LeaseProperties leaseProperties) {
+    public TaskService(
+            TaskRepository taskRepository,
+            TaskAttemptRepository taskAttemptRepository,
+            LeaseProperties leaseProperties) {
         this.taskRepository = taskRepository;
+        this.taskAttemptRepository = taskAttemptRepository;
         this.leaseProperties = leaseProperties;
         leaseProperties.validate();
     }
@@ -39,10 +53,31 @@ public class TaskService {
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
     }
 
+    /**
+     * The task's attempts, ordered by attempt. A task that was never claimed,
+     * or finished before V6, has none. A missing id is
+     * {@link TaskNotFoundException}. The two reads are not one snapshot; that
+     * is fine because nothing deletes tasks in production.
+     */
+    public List<TaskAttempt> getAttempts(UUID taskId) {
+        requireTaskId(taskId);
+        List<TaskAttempt> attempts = taskAttemptRepository.findByTaskId(taskId);
+        if (attempts.isEmpty() && taskRepository.findById(taskId).isEmpty()) {
+            throw new TaskNotFoundException(taskId);
+        }
+        return attempts;
+    }
+
     @Transactional
     public Task claimTask(UUID workerId) {
         requireWorkerId(workerId);
-        return taskRepository.claimTask(workerId, leaseProperties.leaseMicros());
+        Task claimed = taskRepository.claimTask(workerId, leaseProperties.leaseMicros());
+        if (claimed != null
+                && !taskAttemptRepository.recordStart(claimed.id(), workerId, claimed.attempt())) {
+            log.warn("Attempt {} of task {} for worker {} was not opened: a history row already exists",
+                    claimed.attempt(), claimed.id(), workerId);
+        }
+        return claimed;
     }
 
     /**
@@ -62,24 +97,18 @@ public class TaskService {
     public TransitionResult completeTask(UUID taskId, UUID workerId, int attempt, String result) {
         requireTaskId(taskId);
         requireWorkerId(workerId);
-        return classifyFinish(
-                taskRepository.completeTask(taskId, workerId, attempt, result),
-                taskId,
-                workerId,
-                attempt,
-                TaskStatus.COMPLETED);
+        Optional<Task> updated = taskRepository.completeTask(taskId, workerId, attempt, result);
+        updated.ifPresent(task -> recordFinish(task, AttemptOutcome.COMPLETED));
+        return classifyFinish(updated, taskId, workerId, attempt, TaskStatus.COMPLETED);
     }
 
     @Transactional
     public TransitionResult failTask(UUID taskId, UUID workerId, int attempt, String error) {
         requireTaskId(taskId);
         requireWorkerId(workerId);
-        return classifyFinish(
-                taskRepository.failTask(taskId, workerId, attempt, stripNullBytes(error)),
-                taskId,
-                workerId,
-                attempt,
-                TaskStatus.FAILED);
+        Optional<Task> updated = taskRepository.failTask(taskId, workerId, attempt, stripNullBytes(error));
+        updated.ifPresent(task -> recordFinish(task, AttemptOutcome.FAILED));
+        return classifyFinish(updated, taskId, workerId, attempt, TaskStatus.FAILED);
     }
 
     @Transactional
@@ -95,6 +124,14 @@ public class TaskService {
             return new CancelResult.AlreadyCancelled(current);
         }
         return new CancelResult.NotCancellable(current.status());
+    }
+
+    /** Runs only for an applied finish, never after the zero-row read in {@link #classifyFinish}. */
+    private void recordFinish(Task finished, AttemptOutcome outcome) {
+        if (!taskAttemptRepository.recordFinish(finished.id(), finished.attempt(), outcome)) {
+            log.warn("Attempt {} of task {} for worker {} was not closed as {}: it was already closed",
+                    finished.attempt(), finished.id(), finished.workerId(), outcome);
+        }
     }
 
     /**
