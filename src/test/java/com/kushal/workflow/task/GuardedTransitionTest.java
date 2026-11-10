@@ -31,8 +31,9 @@ import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 /**
  * Proves that complete, fail, and cancel are each one update, and that the
- * {@code WHERE} clause decides whether the row changes. A rejected write
- * leaves every column as it was, including the backdated {@code updated_at}.
+ * {@code WHERE} clause decides whether the row changes. Complete and fail
+ * also require the attempt the caller supplies. A rejected write leaves
+ * every column as it was, including the backdated {@code updated_at}.
  */
 @SpringBootTest
 class GuardedTransitionTest extends PostgresIntegrationTest {
@@ -53,17 +54,18 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
     void whereClauseIsTheStateMachine(TaskStatus starting, Operation operation, Kind expected) {
         StoredTask before = insert(starting);
         assertEquals(FIXTURE_TIME, before.updatedAt());
+        assertEquals(0, before.attempt());
 
         switch (operation) {
             case COMPLETE -> assertFinish(
                     expected,
                     operation,
-                    taskService.completeTask(before.id(), OWNER, COMPLETE_RESULT),
+                    taskService.completeTask(before.id(), OWNER, before.attempt(), COMPLETE_RESULT),
                     before);
             case FAIL -> assertFinish(
                     expected,
                     operation,
-                    taskService.failTask(before.id(), OWNER, FAIL_ERROR),
+                    taskService.failTask(before.id(), OWNER, before.attempt(), FAIL_ERROR),
                     before);
             case CANCEL -> assertCancel(expected, taskService.cancelTask(before.id()), before);
         }
@@ -96,12 +98,12 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
 
         TransitionResult.Applied first = assertInstanceOf(
                 TransitionResult.Applied.class,
-                taskService.completeTask(claimed.id(), workerId, "{\"n\":1}"));
+                taskService.completeTask(claimed.id(), workerId, claimed.attempt(), "{\"n\":1}"));
         StoredTask afterFirst = read(claimed.id());
 
         TransitionResult.AlreadyApplied second = assertInstanceOf(
                 TransitionResult.AlreadyApplied.class,
-                taskService.completeTask(claimed.id(), workerId, "{\"n\":2}"));
+                taskService.completeTask(claimed.id(), workerId, claimed.attempt(), "{\"n\":2}"));
 
         assertEquals(afterFirst, read(claimed.id()));
         assertEquals(first.task().result(), second.task().result());
@@ -119,7 +121,7 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
 
         TransitionResult.Rejected rejected = assertInstanceOf(
                 TransitionResult.Rejected.class,
-                taskService.completeTask(claimed.id(), UUID.randomUUID(), "{\"x\":1}"));
+                taskService.completeTask(claimed.id(), UUID.randomUUID(), claimed.attempt(), "{\"x\":1}"));
 
         assertEquals(TaskStatus.RUNNING, rejected.currentStatus());
         assertEquals(owner, rejected.currentWorker());
@@ -152,14 +154,14 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
         StoredTask ownedByB = read(claimed.id());
         TransitionResult.Rejected rejected = assertInstanceOf(
                 TransitionResult.Rejected.class,
-                taskService.completeTask(claimed.id(), workerA, "{\"by\":\"A\"}"));
+                taskService.completeTask(claimed.id(), workerA, claimed.attempt(), "{\"by\":\"A\"}"));
         assertEquals(TaskStatus.RUNNING, rejected.currentStatus());
         assertEquals(workerB, rejected.currentWorker());
         assertEquals(ownedByB, read(claimed.id()));
 
         TransitionResult.Applied applied = assertInstanceOf(
                 TransitionResult.Applied.class,
-                taskService.completeTask(claimed.id(), workerB, "{\"by\":\"B\"}"));
+                taskService.completeTask(claimed.id(), workerB, claimedByB.attempt(), "{\"by\":\"B\"}"));
         assertEquals(TaskStatus.COMPLETED, applied.task().status());
         assertTrue(resultEquals(claimed.id(), "{\"by\":\"B\"}"));
         assertTrue(applied.task().updatedAt().isAfter(ownedByB.updatedAt()));
@@ -172,13 +174,13 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
 
         TransitionResult.Rejected completed = assertInstanceOf(
                 TransitionResult.Rejected.class,
-                taskService.completeTask(missing, UUID.randomUUID(), "{\"x\":1}"));
+                taskService.completeTask(missing, UUID.randomUUID(), 1, "{\"x\":1}"));
         assertNull(completed.currentStatus());
         assertNull(completed.currentWorker());
 
         TransitionResult.Rejected failed = assertInstanceOf(
                 TransitionResult.Rejected.class,
-                taskService.failTask(missing, UUID.randomUUID(), "gone"));
+                taskService.failTask(missing, UUID.randomUUID(), 1, "gone"));
         assertNull(failed.currentStatus());
         assertNull(failed.currentWorker());
 
@@ -192,11 +194,11 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
         Task created = taskService.createTask("NOOP", "{\"test\":\"null-guard\"}");
 
         assertThrows(IllegalArgumentException.class,
-                () -> taskService.completeTask(created.id(), null, "{}"));
+                () -> taskService.completeTask(created.id(), null, 0, "{}"));
         assertThrows(IllegalArgumentException.class,
-                () -> taskService.failTask(created.id(), null, "x"));
+                () -> taskService.failTask(created.id(), null, 0, "x"));
         assertThrows(IllegalArgumentException.class,
-                () -> taskService.completeTask(null, UUID.randomUUID(), "{}"));
+                () -> taskService.completeTask(null, UUID.randomUUID(), 0, "{}"));
         assertThrows(IllegalArgumentException.class,
                 () -> taskService.cancelTask(null));
 
@@ -211,7 +213,7 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
 
         TransitionResult.Applied applied = assertInstanceOf(
                 TransitionResult.Applied.class,
-                taskService.failTask(claimed.id(), workerId, error));
+                taskService.failTask(claimed.id(), workerId, claimed.attempt(), error));
 
         assertEquals("a".repeat(4000), applied.task().error());
         assertFalse(applied.task().error().indexOf('\0') >= 0);
@@ -238,6 +240,9 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
                 assertEquals("CANCELLED", after.status());
                 assertNull(after.workerId());
                 assertNull(after.claimedAt());
+                assertEquals(before.attempt(), after.attempt());
+                assertEquals(before.leaseExpiresAt(), after.leaseExpiresAt());
+                assertEquals(before.lastHeartbeatAt(), after.lastHeartbeatAt());
                 assertUntouchedPayload(before, after);
             }
             case ALREADY_CANCELLED -> {
@@ -261,6 +266,12 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
         assertUntouchedPayload(before, after);
         assertEquals(before.claimedAt(), after.claimedAt());
         assertEquals(before.workerId(), after.workerId());
+        assertEquals(before.attempt(), after.attempt());
+        assertEquals(before.leaseExpiresAt(), after.leaseExpiresAt());
+        assertEquals(before.lastHeartbeatAt(), after.lastHeartbeatAt());
+        assertEquals(before.attempt(), applied.task().attempt());
+        assertEquals(before.leaseExpiresAt(), applied.task().leaseExpiresAt());
+        assertEquals(before.lastHeartbeatAt(), applied.task().lastHeartbeatAt());
         if (operation == Operation.COMPLETE) {
             assertEquals("COMPLETED", after.status());
             assertEquals(TaskStatus.COMPLETED, applied.task().status());
@@ -278,6 +289,7 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
     private void assertAlreadyApplied(TransitionResult result, StoredTask before, StoredTask after) {
         TransitionResult.AlreadyApplied already = assertInstanceOf(TransitionResult.AlreadyApplied.class, result);
         assertEquals(before, after);
+        assertEquals(before.attempt(), already.task().attempt());
         assertEquals(before.result(), already.task().result());
         assertEquals(before.error(), already.task().error());
         assertEquals(before.updatedAt(), already.task().updatedAt());
@@ -320,19 +332,22 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
         UUID workerId = status == TaskStatus.PENDING || status == TaskStatus.CANCELLED ? null : OWNER;
         Instant claimedAt = workerId == null ? null : FIXTURE_TIME;
         Instant finishedAt = status.isTerminal() ? FIXTURE_TIME : null;
+        Instant leaseExpiresAt = status == TaskStatus.RUNNING ? claimedAt : null;
         String result = status == TaskStatus.COMPLETED ? "{\"from\":\"fixture\"}" : null;
         String error = status == TaskStatus.FAILED ? "fixture-error" : null;
 
         jdbcClient.sql("""
                         INSERT INTO tasks (
                             id, task_type, status, payload, result, error,
-                            created_at, updated_at, claimed_at, finished_at, worker_id
+                            created_at, updated_at, claimed_at, finished_at, worker_id,
+                            lease_expires_at
                         ) VALUES (
                             :id, 'NOOP', :status, CAST(:payload AS jsonb),
                             CAST(:result AS jsonb), :error,
                             CAST(:createdAt AS timestamptz), CAST(:updatedAt AS timestamptz),
                             CAST(:claimedAt AS timestamptz), CAST(:finishedAt AS timestamptz),
-                            CAST(:workerId AS uuid)
+                            CAST(:workerId AS uuid),
+                            CAST(:leaseExpiresAt AS timestamptz)
                         )
                         """)
                 .param("id", id)
@@ -345,6 +360,7 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
                 .param("claimedAt", offset(claimedAt), Types.TIMESTAMP_WITH_TIMEZONE)
                 .param("finishedAt", offset(finishedAt), Types.TIMESTAMP_WITH_TIMEZONE)
                 .param("workerId", workerId, Types.OTHER)
+                .param("leaseExpiresAt", offset(leaseExpiresAt), Types.TIMESTAMP_WITH_TIMEZONE)
                 .update();
         return read(id);
     }
@@ -352,7 +368,8 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
     private StoredTask read(UUID id) {
         return jdbcClient.sql("""
                         SELECT id, task_type, status, payload::text AS payload, result::text AS result,
-                               error, created_at, updated_at, claimed_at, finished_at, worker_id
+                               error, created_at, updated_at, claimed_at, finished_at, worker_id,
+                               attempt, lease_expires_at, last_heartbeat_at
                         FROM tasks
                         WHERE id = :id
                         """)
@@ -368,7 +385,10 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
                         instant(rs, "updated_at"),
                         instant(rs, "claimed_at"),
                         instant(rs, "finished_at"),
-                        rs.getObject("worker_id", UUID.class)))
+                        rs.getObject("worker_id", UUID.class),
+                        rs.getInt("attempt"),
+                        instant(rs, "lease_expires_at"),
+                        instant(rs, "last_heartbeat_at")))
                 .single();
     }
 
@@ -412,7 +432,10 @@ class GuardedTransitionTest extends PostgresIntegrationTest {
             Instant updatedAt,
             Instant claimedAt,
             Instant finishedAt,
-            UUID workerId
+            UUID workerId,
+            int attempt,
+            Instant leaseExpiresAt,
+            Instant lastHeartbeatAt
     ) {
     }
 }

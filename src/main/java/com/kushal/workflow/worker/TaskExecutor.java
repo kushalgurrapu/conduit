@@ -132,11 +132,13 @@ public class TaskExecutor {
     private void finish(Task claimed, UUID workerId, TaskOutcome outcome) {
         boolean interrupted = Thread.interrupted();
         try {
+            // The attempt is the one claim returned. Reading it again here
+            // would let a stale handler finish the attempt that replaced it.
             TransitionResult result = switch (outcome) {
                 case TaskOutcome.Succeeded succeeded -> taskService.completeTask(
-                        claimed.id(), workerId, jsonText(succeeded.result()));
+                        claimed.id(), workerId, claimed.attempt(), jsonText(succeeded.result()));
                 case TaskOutcome.Failed failed -> taskService.failTask(
-                        claimed.id(), workerId, failed.reason());
+                        claimed.id(), workerId, claimed.attempt(), failed.reason());
             };
             if (!(result instanceof TransitionResult.Applied)
                     && !(result instanceof TransitionResult.AlreadyApplied)) {

@@ -78,6 +78,7 @@ class V4MigrationTest extends PostgresContainerSupport {
         Flyway.configure()
                 .dataSource(url, postgres.getUsername(), postgres.getPassword())
                 .locations("classpath:db/migration")
+                .target("4")
                 .load()
                 .migrate();
 

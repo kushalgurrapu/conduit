@@ -247,6 +247,9 @@ class TaskControllerTest {
                 UPDATED,
                 claimedAt,
                 finishedAt,
-                workerId);
+                workerId,
+                0,
+                null,
+                null);
     }
 }

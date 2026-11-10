@@ -246,7 +246,8 @@ class TransitionLockHoldTest extends PostgresIntegrationTest {
                 SET status = 'RUNNING',
                     claimed_at = NOW(),
                     worker_id = ?,
-                    updated_at = NOW()
+                    updated_at = NOW(),
+                    lease_expires_at = NOW()
                 WHERE id = ?
                   AND status = 'PENDING'
                 """)) {

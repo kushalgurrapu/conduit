@@ -62,10 +62,13 @@ introduced when it solves a real problem in the current milestone.
 -   Docker Compose for the full stack (application, workers, observability)
 -   OpenTelemetry
 -   Prometheus/Grafana
+-   AWS for the M15 deployment: one EC2 instance running Docker Compose,
+    RDS for PostgreSQL, ECR, and SSM Parameter Store, with a measured
+    monthly cost
 
-Technologies such as Kafka, Kubernetes, Terraform, and cloud
-infrastructure are intentionally deferred until there is a concrete
-reason to introduce them.
+Technologies such as Kafka, Kubernetes, and Terraform are intentionally
+deferred until there is a concrete reason to introduce them. The AWS
+deployment waits for M15 and stays limited to the services listed above.
 
 ## Current Architecture
 

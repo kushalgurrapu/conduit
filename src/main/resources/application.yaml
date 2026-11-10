@@ -34,6 +34,12 @@ engine:
     max-idle-interval: 30s
     error-backoff: 1s
     shutdown-timeout: 20s
+  lease:
+    # Heartbeat every lease/3 is a starting heuristic, not a proved constant.
+    # Both values must be at least one microsecond, and the interval must be
+    # shorter than the duration. An interval longer than one third still starts.
+    duration: 30s
+    heartbeat-interval: 10s
 
 management:
   endpoint:

@@ -14,6 +14,9 @@ public record Task(
         Instant updatedAt,
         Instant claimedAt,
         Instant finishedAt,
-        UUID workerId
+        UUID workerId,
+        int attempt,
+        Instant leaseExpiresAt,
+        Instant lastHeartbeatAt
 ) {
 }

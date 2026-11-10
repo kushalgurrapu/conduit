@@ -24,6 +24,9 @@ class ClaimUpdatedAtTest extends PostgresIntegrationTest {
     private TaskService taskService;
 
     @Autowired
+    private LeaseProperties leaseProperties;
+
+    @Autowired
     private JdbcClient jdbcClient;
 
     @Test
@@ -70,6 +73,44 @@ class ClaimUpdatedAtTest extends PostgresIntegrationTest {
                 .single();
         assertEquals(claimed.updatedAt(), storedUpdatedAt);
         assertEquals(claimed.claimedAt(), storedClaimedAt);
+    }
+
+    @Test
+    void claimSetsTheLeaseAndIncrementsAttemptOncePerTask() {
+        Task first = taskService.createTask("NOOP", "{\"n\":1}");
+        Task second = taskService.createTask("NOOP", "{\"n\":2}");
+        assertEquals(0, first.attempt());
+        assertNull(first.leaseExpiresAt());
+        assertNull(first.lastHeartbeatAt());
+        assertEquals(0, second.attempt());
+
+        Task claimedFirst = taskService.claimTask(UUID.randomUUID());
+        Task claimedSecond = taskService.claimTask(UUID.randomUUID());
+
+        assertEquals(first.id(), claimedFirst.id());
+        assertEquals(second.id(), claimedSecond.id());
+        assertEquals(1, claimedFirst.attempt());
+        assertEquals(1, claimedSecond.attempt());
+        assertNull(claimedFirst.lastHeartbeatAt());
+        assertNull(claimedSecond.lastHeartbeatAt());
+        assertEquals(claimedFirst.claimedAt(), claimedFirst.updatedAt());
+        assertLeaseMatchesClaim(claimedFirst.id());
+        assertLeaseMatchesClaim(claimedSecond.id());
+    }
+
+    private void assertLeaseMatchesClaim(UUID id) {
+        Boolean matches = jdbcClient.sql("""
+                SELECT lease_expires_at = claimed_at + (:leaseMicros * INTERVAL '1 microsecond')
+                   AND attempt = 1
+                   AND last_heartbeat_at IS NULL
+                FROM tasks
+                WHERE id = :id
+                """)
+                .param("leaseMicros", leaseProperties.leaseMicros())
+                .param("id", id)
+                .query(Boolean.class)
+                .single();
+        assertEquals(Boolean.TRUE, matches);
     }
 
     @Test

@@ -16,6 +16,12 @@ The original text of this file was written on 2026-10-02 from a read of the repo
 
 **Update (reconciliation, 2026-10-12):** Idle backoff and the `workerPool` health component are in the tree (`8a9fef3`). They are part of M1, not a new milestone. Milestone numbers were checked against git history and were not renumbered. See "Current state" and the M3 "Start here" block.
 
+**Update (M3.1, 2026-10-13):** Claim writes `lease_expires_at = NOW() + (:leaseMicros * INTERVAL '1 microsecond')`, where `leaseMicros = duration.toNanos() / 1_000`. Startup rejects a duration under one microsecond. Lease extension uses the same conversion when it is built. V5, the column mapping, and the claim write are M3.1. Heartbeats, `extendLease`, and the attempt guard on complete and fail are later parts of M3.
+
+**Update (M3.2, 2026-10-13):** `extendLease` succeeds only for that id, `RUNNING`, that `worker_id`, and that `attempt`. It sets `lease_expires_at` with the M3.1 microsecond expression and sets `last_heartbeat_at`. It does not change `updated_at`, and a past lease still extends. Complete and fail include `attempt` in the existing guard. `AlreadyApplied` is this worker, this attempt, and the target status. `TaskExecutor` finishes with the attempt claim returned. Heartbeats, `TaskContext` lease loss, response fields, and the docs sync are still later parts of M3. On this machine, `.\mvnw.cmd -B verify` finished with BUILD SUCCESS: 108 tests, 0 failures, 0 errors, 0 skipped (2026-10-13).
+
+**Update (planning, 2026-10-16):** The M15 cloud target is AWS: one Graviton EC2 instance running Docker Compose, RDS for PostgreSQL, ECR, GitHub OIDC, SSM Parameter Store, and Caddy for TLS. Cost controls and a measured cost per million tasks are part of M15's definition of done. See "AWS target" under M15. This does not change M3 or any milestone before M15.
+
 ---
 
 ## Current state (verified 2026-10-12)
@@ -31,7 +37,7 @@ Audit base: `main` at `8a9fef3`, tracking `origin/main`. Package `com.kushal.wor
 | M0 Foundation | Complete | Implementation, tests, and docs. V3, shared Testcontainers, skip-locked test, Compose, env-based datasource, ADRs 0001–0003, GitHub Actions. |
 | M1 Lifecycle, API, and workers | Complete | Implementation and tests. Includes the original M2 worker runtime, merged in commit `696080d` (2026-10-05). M1.0–M1.6 are in the tree. Idle backoff and `workerPool` health (`8a9fef3`, 2026-10-12) are part of this milestone. |
 | M2 Worker runtime | Merged into M1 | Not a milestone. Do not schedule it and do not implement it again. |
-| M3 Leases and heartbeats | Next. Not started | No lease column, attempt counter, heartbeat, or lease configuration in code, schema, or tests. |
+| M3 Leases and heartbeats | M3.2 in the tree | V5 and the claim lease are in place. `extendLease` moves the lease for the owning worker and attempt. Complete and fail require that attempt. Heartbeats, response fields, and the docs sync are not built yet. |
 | M4–M16 | Not started | Recovery, fencing proof, retries, idempotency, workflows, and everything after them. |
 
 ### Numbering (do not renumber)
@@ -49,18 +55,19 @@ Fencing is split on purpose, and that split stays:
 
 Evidence is the code and the test classes named in the README "How this is tested" section. A passing test name is not treated as proof unless that test is in the tree.
 
-- **Schema.** V1 creates `tasks`. V2 drops the `claimed_at` default. V3 converts timestamps to `timestamptz`, adds `updated_at`, `tasks_status_check`, and `idx_tasks_pending`. V4 adds `task_type`, `result`, `error`, `finished_at`, backfills legacy rows, and adds the four named checks. A `RUNNING` row with no owner fails V4 rather than being repaired.
-- **Lifecycle.** `PENDING → RUNNING` (claim), `RUNNING → COMPLETED` or `FAILED` (owning `worker_id` only), `PENDING → CANCELLED`. No engine path from `RUNNING` back to `PENDING`. `TaskStatus` has `isTerminal()` only. The `WHERE` clause is the state machine.
-- **Claim.** `FOR UPDATE SKIP LOCKED`, then an update that requires `PENDING` again, sets `worker_id`, `claimed_at`, and `updated_at`, and returns the mapped columns. A null worker id is rejected in Java. An empty queue returns null.
-- **Finish and cancel.** One update each. Zero rows is classified and not retried. Cancel of a missing id throws `TaskNotFoundException`.
+- **Schema.** V1 creates `tasks`. V2 drops the `claimed_at` default. V3 converts timestamps to `timestamptz`, adds `updated_at`, `tasks_status_check`, and `idx_tasks_pending`. V4 adds `task_type`, `result`, `error`, `finished_at`, backfills legacy rows, and adds the four named checks. A `RUNNING` row with no owner fails V4 rather than being repaired. V5 (M3.1) adds `lease_expires_at`, `attempt` (default 0), and `last_heartbeat_at`, backfills a running lease from `claimed_at`, and replaces `tasks_running_has_owner_check` so `RUNNING` also requires `lease_expires_at`.
+- **Lifecycle.** `PENDING → RUNNING` (claim), `RUNNING → COMPLETED` or `FAILED` (owning `worker_id` and the attempt from that claim), `PENDING → CANCELLED`. No engine path from `RUNNING` back to `PENDING`. `TaskStatus` has `isTerminal()` only. The `WHERE` clause is the state machine. Complete and fail do not require an unexpired lease.
+- **Claim.** `FOR UPDATE SKIP LOCKED`, then an update that requires `PENDING` again, sets `worker_id`, `claimed_at`, and `updated_at`, and returns the mapped columns. M3.1 also sets `lease_expires_at` from `leaseMicros`, increments `attempt`, and clears `last_heartbeat_at`. A null worker id is rejected in Java. An empty queue returns null.
+- **Lease extension.** `extendLease` is one update. The guard is `id`, `RUNNING`, `worker_id`, and `attempt`. It sets `lease_expires_at` from `leaseMicros` and `last_heartbeat_at` to `NOW()`. It does not change `updated_at`, status, worker, or attempt. A past lease still matches. Zero rows is `false` and is not retried.
+- **Finish and cancel.** One update each. Complete and fail also require `attempt`. Zero rows is classified and not retried. `AlreadyApplied` is the same worker, the same attempt, and the target status. A different attempt is `Rejected`. Cancel of a missing id throws `TaskNotFoundException`. Cancel does not take an attempt.
 - **API.** `POST /api/v1/tasks` (`201`, `Location`, `TaskResponse`), `GET /api/v1/tasks/{id}` (`200` or `404`), `POST /api/v1/tasks/{id}/cancel` (`200` pending or already cancelled, `409` running or other terminal, `404` missing). `taskType` is format-checked only. Errors are RFC 9457 `ProblemDetail`. There is no list, retry, claim, complete, or fail endpoint. `POST /tasks` and `POST /tasks/claim` are gone.
-- **Workers.** `TaskExecutor.runOnce` is one claim, one handler call with no transaction and no pooled connection, and one finish write. `NOOP`, `ECHO`, `FAIL`, and `SLEEP` are always registered. `WorkerPool` runs `engine.worker.concurrency` platform threads (default 4) when `engine.worker.enabled` is true. Each loop has one UUID. Empty claims wait with exponential delay and equal jitter (`IdleBackoff`). Shutdown stops new claims, finishes a claimed task, and interrupts a handler still running at `shutdown-timeout` (default 20s), leaving that task `RUNNING`.
+- **Workers.** `TaskExecutor.runOnce` is one claim, one handler call with no transaction and no pooled connection, and one finish write. The finish uses the attempt on the claimed task. There is no heartbeat scheduler yet. `NOOP`, `ECHO`, `FAIL`, and `SLEEP` are always registered. `WorkerPool` runs `engine.worker.concurrency` platform threads (default 4) when `engine.worker.enabled` is true. Each loop has one UUID. Empty claims wait with exponential delay and equal jitter (`IdleBackoff`). Shutdown stops new claims, finishes a claimed task, and interrupts a handler still running at `shutdown-timeout` (default 20s), leaving that task `RUNNING`.
 - **Health.** `/actuator/health` includes `workerPool`. It is worker-loop readiness only: `UP` when workers are disabled, or when the pool is running and `liveLoops` equals `concurrency` with no unexpected exit. `OUT_OF_SERVICE` while stopped, stopping, or not yet fully live. `DOWN` after a loop exits while the pool is still started. It does not mean the database is reachable or that tasks are moving. Do not assume `workerPool` is the only health contributor.
-- **Tests in the tree.** Concurrent claim, skip-locked, guarded transitions, cancel-versus-claim lock hold, V4 migration, claim `updated_at`, executor, handler configuration, worker pool (including shutdown, idle reset, a 1,000-task run, and health), idle backoff, worker properties, health-indicator table, and the HTTP API. Integration tests extend `PostgresIntegrationTest` (one Testcontainers PostgreSQL, workers off, `DELETE FROM tasks` before each test) except `V4MigrationTest`, which uses its own database.
+- **Tests in the tree.** Concurrent claim, skip-locked, guarded transitions, lease extension and the attempt fence, cancel-versus-claim lock hold, V4 migration, V5 migration, claim `updated_at`, lease properties, executor, handler configuration, worker pool (including shutdown, idle reset, a 1,000-task run, and health), idle backoff, worker properties, health-indicator table, and the HTTP API. Integration tests extend `PostgresIntegrationTest` (one Testcontainers PostgreSQL, workers off, `DELETE FROM tasks` before each test) except `V4MigrationTest` and `V5MigrationTest`, which use their own databases.
 
 ### Not implemented
 
-Attempt counter, leases, heartbeats, crash recovery, a reaper, fencing against a later claim, retries, idempotency keys, workflow definitions, scheduling, auth, OpenAPI, and a list endpoint. A crash after claim, an interrupt during the handler, or a finish write that throws leaves the task `RUNNING`. That is lost work until an operator requeues by hand or until M4. The engine is not at-least-once today (ADR 0002).
+Heartbeats, `TaskContext` lease loss, `attempt` and `leaseExpiresAt` on `TaskResponse`, crash recovery, a reaper, the crash and zombie proofs, retries, idempotency keys, workflow definitions, scheduling, auth, OpenAPI, and a list endpoint. Claim stores `attempt` and a lease (M3.1). `extendLease` and the attempt guard on complete and fail are in the tree (M3.2). A crash after claim, an interrupt during the handler, or a finish write that throws leaves the task `RUNNING`. That is lost work until an operator requeues by hand or until M4. The engine is not at-least-once today (ADR 0002).
 
 ### Known behavior that is not a reason to reopen M1
 
@@ -158,12 +165,14 @@ These keep later milestones coherent. Record each as a short ADR in `docs/adr/` 
 - Wait-for-external-signal step (resume via API)
 - Parallel fan-out/join steps
 - Load and chaos test harness (k6 or a Java load generator)
-- Deploying compose to a single cloud VM
+- Deploying compose to a single AWS EC2 instance with RDS for PostgreSQL (M15)
+- AWS cost controls: tags, a budget alert, and a measured cost per million tasks (M15)
 - Retention/cleanup job for old tasks
 
 ### C. STRETCH / OPTIONAL (only with a clear technical reason)
 
-- Terraform for the single VM
+- Terraform for the single EC2 instance and the RDS instance
+- A second EC2 instance on Spot running `engine.role=worker`. The two-minute interruption notice exercises graceful shutdown, and M4 lease recovery picks up whatever it leaves `RUNNING`. Needs M4.
 - Postgres row-level security for tenant isolation
 - Saga/compensation steps
 - SSE for live UI updates
@@ -177,6 +186,7 @@ These keep later milestones coherent. Record each as a short ADR in `docs/adr/` 
 - **Redis** (rate limiting in Postgres is fine at this scale; revisit only if benchmarks show the DB is the bottleneck).
 - **Kafka** (nothing in this system needs a log; an outbox table is enough).
 - **Kubernetes, service mesh, Helm.**
+- **AWS beyond one EC2 instance and one RDS instance.** No ECS, EKS, Fargate, Lambda, Aurora, Multi-AZ, ALB, NAT gateway, or SQS/SNS/EventBridge as the queue. The Spot worker in section C is the only planned exception.
 - **Microservices split** (one jar, role-switched).
 - **Quartz, Temporal, Camunda, Spring Batch** (they would replace the learning).
 - **JavaScript or SpEL expression evaluation** in conditions (security risk).
@@ -235,7 +245,7 @@ Estimates assume one person at 10-15 hours/week with AI assistance. They include
 - M12 Operations API: Medium, 1-2 weeks
 - M13 Frontend: Large, 3-4 weeks
 - M14 Load and chaos testing: Medium, 1.5-2 weeks
-- M15 Packaging, CI/CD, deployment: Medium, 2 weeks
+- M15 Packaging, CI/CD, AWS deployment: Medium, 2-3 weeks
 - M16 Portfolio polish: Small, 1 week
 
 **Totals:** full roadmap about 30-40 weeks (7-9 months). The minimum resume-ready version (see section 6) is about 18-23 weeks.
@@ -455,8 +465,8 @@ Write a short implementation plan in a later session if you want one. This secti
 - `now()` (transaction start) vs `clock_timestamp()`.
 
 **Implementation tasks**
-- Update `claimTask` to set `lease_expires_at = now() + :leaseSeconds` and `attempt = attempt + 1`.
-- `TaskRepository.extendLease(taskId, workerId, attempt, leaseSeconds)`: a guarded update returning a boolean.
+- Update `claimTask` to set `lease_expires_at = NOW() + (:leaseMicros * INTERVAL '1 microsecond')` and `attempt = attempt + 1`. `leaseMicros` is `duration.toNanos() / 1_000`. The same conversion is used when a lease is extended. Do not truncate the duration to integer seconds.
+- `TaskRepository.extendLease(taskId, workerId, attempt, leaseMicros)`: a guarded update returning a boolean. M3.2. Not part of M3.1.
 - Worker heartbeat: a scheduled task per in-flight task (or a shared scheduler) that extends the lease; if extension returns false, signal the handler to abort (cooperative cancellation via the `TaskContext`).
 - Config: `engine.lease.duration`, `engine.lease.heartbeat-interval`.
 - Guard `completeTask` and `failTask` with `attempt`. The original wording named `markCompleted` / `markFailed`; those methods do not exist. Do not also require `lease_expires_at > now()` on those writes. That check is M4. Zero rows stays a value.
@@ -968,34 +978,91 @@ The `attempt` column and the `attempt` guard on complete, fail, and lease extens
 
 ---
 
-## M15. Packaging, CI/CD, and deployment
+## M15. Packaging, CI/CD, and deployment on AWS
 
-**Complexity:** Medium. **Time:** about 2 weeks. **Depends on:** M13, M14 (a minimal version can be done after M11).
+**Complexity:** Medium. **Time:** about 2-3 weeks. **Depends on:** M13, M14 (a minimal version can be done after M11; the cost-per-task figure needs M14).
 
-**Goal:** one-command local run, automated builds, and one real deployment.
+**Goal:** one-command local run, automated builds, and one real deployment on AWS that is small, closed by default, and cheap enough to leave running for a demo.
 
-**Concepts to understand first:** multi-stage Docker builds; liveness vs readiness probes; graceful shutdown in containers; twelve-factor configuration; running API and worker roles from one image.
+**Concepts to understand first**
+- Multi-stage Docker builds; multi-architecture images (`linux/arm64` for Graviton).
+- Liveness vs readiness probes; graceful shutdown in containers; twelve-factor configuration; running API and worker roles from one image.
+- VPC basics: public vs private subnets, security groups that reference other security groups.
+- IAM roles vs long-lived access keys; instance profiles; GitHub Actions OIDC federation.
+- What RDS takes off your hands (backups, minor-version patching) and what it does not (`max_connections`, maintenance restarts, connection drops).
+- Where an AWS bill comes from: instance hours, EBS and RDS storage, backups beyond the free allowance, public IPv4 addresses, data transfer out, NAT gateways, load balancers, and log storage.
+
+### AWS target (decided 2026-10-16)
+
+| Piece | Choice | Why | Not chosen |
+| --- | --- | --- | --- |
+| Compute | One EC2 instance, Graviton (start with `t4g.small`), Amazon Linux 2023, Docker Compose running the API and worker roles, Caddy, Prometheus, and Grafana | Same Compose stack as local; keeps the one-VM rule | ECS, Fargate, EKS, Lambda. Lightsail is the fallback if EC2 setup becomes the bottleneck |
+| Database | RDS for PostgreSQL 16 (the Testcontainers version), single-AZ, `db.t4g.micro`, gp3, not publicly accessible | Managed backups and patching; Postgres stays the only core infrastructure (ADR 0001) | Aurora, Multi-AZ. Postgres in a container on the instance is the cheapest fallback and loses managed backups |
+| Images | ECR, one repository, lifecycle policy that keeps the last few images | The instance pulls with its IAM role; no registry token on the box | GHCR (acceptable if ECR is skipped) |
+| CI access | GitHub Actions assumes an IAM role through OIDC, scoped to this repository and to tag builds | No long-lived AWS keys in GitHub | IAM user access keys |
+| Secrets | SSM Parameter Store `SecureString`, read by the instance role at deploy time | Standard parameters have no extra charge | Secrets Manager (rotation is not needed here) |
+| Ingress and TLS | Caddy on the instance with Let's Encrypt, one Elastic IP, security group open on 80 and 443 only | No load balancer charge | ALB, CloudFront, API Gateway |
+| Shell access | SSM Session Manager | Port 22 stays closed; no SSH key to manage | Bastion host, open SSH |
+| Network | EC2 in a public subnet; RDS in private subnets; the RDS security group allows 5432 only from the EC2 security group | No NAT gateway required | NAT gateway, VPC endpoints |
+| Observability | Prometheus and Grafana in Compose on the instance. Grafana and actuator are not public; reach them through Session Manager port forwarding | Reuses M11 unchanged | Amazon Managed Prometheus or Grafana |
+| Logs | Docker `json-file` logging with size rotation. CloudWatch Logs only with an explicit retention period | CloudWatch log groups never expire by default | Unbounded CloudWatch logs |
+| Provisioning | Console or AWS CLI steps written down in `docs/aws-deployment.md` | Reproducible without adding a tool | CDK, CloudFormation. Terraform is the section C stretch |
+
+Record this table, and the options not chosen, as ADR 0005 when M15 starts.
+
+### Cost controls
+
+These are part of the definition of done, not polish.
+
+- Tag every resource with `project=durable-workflow-engine` and activate it as a cost allocation tag.
+- An AWS Budgets monthly budget with email alerts before the limit is reached.
+- Graviton instance classes, gp3 storage, single AZ, no NAT gateway, no load balancer, exactly one Elastic IP.
+- RDS: short automated backup retention and a maximum for storage autoscaling.
+- ECR lifecycle policy, Docker log rotation, CloudWatch retention if CloudWatch is used.
+- The M12 retention job keeps `tasks` and event tables from growing without bound on RDS storage.
+- Size the instance and the RDS class from M14 numbers, not guesses. Check API plus worker Hikari pool sizes against the RDS instance's `max_connections`.
+- Record the actual monthly cost from Cost Explorer, and derive a cost per million tasks from M14 throughput on the deployed instance. Both go in `docs/aws-deployment.md` with the date and region.
+- `docs/aws-deployment.md` has a teardown section that removes everything, including RDS snapshots, ECR images, and the Elastic IP.
 
 **Implementation tasks**
-- Multi-stage `Dockerfile` (Temurin 25 JRE, non-root user, layered jar).
+- Multi-stage `Dockerfile` (Temurin 25 JRE, non-root user, layered jar), built with buildx for `linux/arm64` and `linux/amd64`.
 - `engine.role=api|worker|all` implemented via conditional beans/properties.
 - `docker-compose.yml`: postgres, api, 2 workers, ui, prometheus, grafana. `docker-compose.dev.yml` for local DB only.
-- `server.shutdown=graceful` with a timeout; align with the worker shutdown timeout.
-- GitHub Actions: the verify workflow already exists (M0). This milestone adds image build, push to GHCR on tags, and the UI tests.
-- Deploy compose to a single cloud VM (EC2/Lightsail or equivalent) with a managed or containerized Postgres, HTTPS via Caddy/nginx. Terraform for that VM is a stretch.
-- Secrets via environment variables; no secrets in the repo.
+- `docker-compose.aws.yml` override: no postgres service, datasource from SSM-provided environment variables, `restart: unless-stopped`, log rotation, and Caddy in front of the API and UI.
+- `server.shutdown=graceful` with a timeout; align it with the worker shutdown timeout. Compose `stop_grace_period` must be longer than both, or Docker kills the container before the pool finishes.
+- GitHub Actions: the verify workflow already exists (M0). This milestone adds the image build, push to ECR on tags through OIDC, and the UI tests.
+- Provision the AWS resources in the table above, and write each step in `docs/aws-deployment.md`.
+- Deploy through Session Manager: `docker compose pull`, then `docker compose up -d`. Triggering that from CI with SSM Run Command is optional.
+- Apply the cost controls above.
+- Secrets via environment variables loaded from SSM; no secrets in the repo, in the image, or in GitHub.
 
-**Database changes:** none (confirm Flyway runs safely when several instances start together; it uses a lock table, so document it).
+**Database changes:** none (confirm Flyway runs safely when several instances start together; it uses a lock table, so document it). RDS runs the same major version as Testcontainers.
 
 **API changes:** none.
 
-**Testing strategy:** a CI job that builds the image and runs the compose smoke test; a post-deploy health check.
+**Testing strategy**
+- A CI job that builds the image and runs the compose smoke test.
+- A post-deploy smoke script over HTTPS: `/actuator/health` is `UP` (through port forwarding), an `ECHO` task is created and reaches `COMPLETED`.
+- Reboot the EC2 instance and confirm the stack comes back without manual steps.
+- Reboot the RDS instance during a small load and confirm workers back off and every task still finishes (needs M4 and M5).
 
-**Failure modes:** two instances running migrations (Flyway locks); a rolling restart killing in-flight tasks (leases and graceful shutdown cover this, and the demo should show it); misconfigured pool sizes.
+**Failure modes**
+- Two instances running migrations (Flyway locks).
+- A restart killing in-flight tasks: leases and graceful shutdown cover this, and the demo should show it.
+- Misconfigured pool sizes, or Hikari pools that exceed RDS `max_connections`.
+- An RDS maintenance restart or reboot: connections drop, workers hit `error-backoff`, and tasks claimed before the drop rely on M4 recovery.
+- An instance stop without an Elastic IP changes the public address and breaks DNS.
+- A leaked credential: avoided by having no long-lived keys anywhere.
+- A surprise bill: budget alerts, tags, and the "not chosen" column above.
 
-**Definition of done:** `docker compose up` gives the whole stack; CI is green and publishes an image; a live demo URL exists (or a documented reproducible deploy).
+**Definition of done**
+- `docker compose up` gives the whole stack locally.
+- CI is green and publishes a multi-architecture image to ECR without stored AWS keys.
+- A live HTTPS demo URL on AWS exists, or `docs/aws-deployment.md` rebuilds the deployment from an empty account and tears it down.
+- No inbound port other than 80 and 443; RDS is not publicly accessible.
+- The budget alert is configured, and the measured monthly cost and cost per million tasks are recorded.
 
-**Interview/resume value:** shipping software; containerization; CI/CD.
+**Interview/resume value:** shipping on AWS (EC2, RDS, ECR, IAM roles, OIDC, SSM); least-privilege networking; cost-aware sizing backed by benchmark data rather than guesses.
 
 ---
 
@@ -1007,7 +1074,7 @@ The `attempt` column and the `attempt` guard on complete, fail, and lease extens
 
 **Implementation tasks**
 - README rewrite: the problem, the architecture diagram, the guarantees (at-least-once, fencing, idempotency, no exactly-once), quickstart, a demo script ("kill a worker and watch recovery"), and a link to benchmarks.
-- `docs/`: architecture, guarantees, ADR index, workflow format, runbook, benchmarks, "what I'd do next".
+- `docs/`: architecture, guarantees, ADR index, workflow format, runbook, benchmarks, AWS deployment and cost, "what I'd do next".
 - A short demo GIF/video; tagged `v1.0.0`; license; tidy git history.
 - Resume bullets (see section 6).
 - A final code-quality pass: remove dead code, consistent package names, test naming, and a CI badge.
@@ -1040,9 +1107,12 @@ That is about 18-23 weeks. Suggested resume bullets once complete:
 - "Built a durable workflow execution engine on PostgreSQL (Java/Spring Boot) using `SELECT ... FOR UPDATE SKIP LOCKED` task claiming, lease-based crash recovery, and fencing tokens to reject stale workers."
 - "Implemented at-least-once execution with exponential backoff, dead-lettering, and idempotency keys; verified with Testcontainers concurrency and fault-injection tests."
 
+After M15 (not part of the MVP), with the real numbers filled in:
+- "Deployed to AWS (EC2 Graviton, RDS PostgreSQL, ECR) with GitHub OIDC and no long-lived keys; sized from load-test data at about $X per month and $Y per million tasks."
+
 ## 7. Strong final version
 
-- Everything in the MVP, plus M10 (multi-tenant isolation, fair claiming, token-bucket rate limiting, backpressure), M12 (full API and OpenAPI), M13 (4-screen React dashboard), M14 (chaos invariant suite and published benchmarks), and a live or reproducible cloud deployment.
+- Everything in the MVP, plus M10 (multi-tenant isolation, fair claiming, token-bucket rate limiting, backpressure), M12 (full API and OpenAPI), M13 (4-screen React dashboard), M14 (chaos invariant suite and published benchmarks), and a live or reproducible AWS deployment with its measured cost.
 - Grafana dashboard, tracing, and `LISTEN/NOTIFY` wakeups as the final polish.
 - A story you can tell in an interview: "I broke it on purpose, here is the invariant checker, and here is the data."
 
@@ -1095,6 +1165,7 @@ Stop adding features after M16 (and optionally the extensions that are already i
  Observability: Micrometer -> /actuator/prometheus -> Prometheus -> Grafana
                 JSON logs with taskId/runId/tenantId/workerId/attempt
  Deployment: one image, engine.role = api | worker | all
+ AWS (M15): one EC2 instance (Compose + Caddy) -> RDS for PostgreSQL in private subnets
 ```
 
 ## 10. Proposed final repository structure
@@ -1107,6 +1178,7 @@ durable-workflow-engine/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── docker-compose.dev.yml
+├── docker-compose.aws.yml
 ├── .github/workflows/ci.yml
 ├── docs/
 │   ├── architecture.md
@@ -1114,8 +1186,10 @@ durable-workflow-engine/
 │   ├── workflow-format.md
 │   ├── runbook.md
 │   ├── benchmarks.md
+│   ├── aws-deployment.md        (setup, cost, teardown)
 │   └── adr/ (0001-postgres-as-queue.md, 0002-at-least-once.md, 0003-fencing-via-attempt.md, ...)
 ├── ops/
+│   ├── caddy/Caddyfile
 │   ├── prometheus/prometheus.yml
 │   ├── grafana/ (provisioning + dashboards/engine.json)
 │   └── chaos/ (scenarios + invariant-check.sql)
@@ -1169,7 +1243,8 @@ Bonus: why Postgres-as-queue is appropriate here and when you would move to Kafk
 - **Redis for rate limiting or queuing**: park. Postgres is sufficient; revisit only with benchmark evidence.
 - **Kafka**: park. Nothing in the design needs an event log.
 - **Kubernetes / Helm / service mesh**: park permanently for this project.
-- **Terraform and multi-environment cloud setup**: park; one VM via compose is enough (Terraform for that VM is optional).
+- **Terraform and multi-environment cloud setup**: park; one EC2 instance via compose plus one RDS instance is enough (Terraform for those is optional).
+- **More AWS services for resume value**: park. Each added service needs a problem it solves and a line in the cost section of `docs/aws-deployment.md`.
 - **Splitting into microservices**: park. Use the role switch.
 - **A visual workflow designer / rich UI**: park. Four screens only.
 - **Generic expression engines or scripting steps**: park. A closed condition language is safer.
@@ -1184,4 +1259,4 @@ Bonus: why Postgres-as-queue is appropriate here and when you would move to Kafk
 
 Take one milestone at a time. For each, give the coding agent: the milestone section, the relevant ADRs, and the rule from `PROJECT_CONTEXT.md` ("explain before architectural changes"). Before each milestone, read the "Concepts to understand first" list and try to explain it in your own words. After each milestone, check the Definition of done and update the docs and ADRs.
 
-Decisions that were open when this file was first written: (1) the package is `com.kushal.workflow`; (2) the status vocabulary includes `COMPLETED`, `FAILED`, and `CANCELLED`. Still open, and not needed before M3: choose a single cloud target for M15. A VM running Compose was the recommendation.
+Decisions that were open when this file was first written: (1) the package is `com.kushal.workflow`; (2) the status vocabulary includes `COMPLETED`, `FAILED`, and `CANCELLED`. The M15 cloud target was decided on 2026-10-16: AWS, one EC2 instance running Compose plus RDS for PostgreSQL (see "AWS target" under M15). Nothing remains open before M3.

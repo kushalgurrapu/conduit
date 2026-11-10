@@ -35,7 +35,10 @@ public class TaskRepository {
             instant(rs, "updated_at"),
             instant(rs, "claimed_at"),
             instant(rs, "finished_at"),
-            rs.getObject("worker_id", UUID.class)
+            rs.getObject("worker_id", UUID.class),
+            rs.getInt("attempt"),
+            instant(rs, "lease_expires_at"),
+            instant(rs, "last_heartbeat_at")
     );
 
     private final JdbcClient jdbcClient;
@@ -58,7 +61,7 @@ public class TaskRepository {
                 .single();
     }
 
-    public Task claimTask(UUID workerId) {
+    public Task claimTask(UUID workerId, long leaseMicros) {
         return jdbcClient.sql("""
                 WITH next_task AS (
                     SELECT id
@@ -72,7 +75,10 @@ public class TaskRepository {
                 SET status = 'RUNNING',
                     claimed_at = NOW(),
                     worker_id = :workerId,
-                    updated_at = NOW()
+                    updated_at = NOW(),
+                    lease_expires_at = NOW() + (:leaseMicros * INTERVAL '1 microsecond'),
+                    attempt = attempt + 1,
+                    last_heartbeat_at = NULL
                 FROM next_task
                 WHERE t.id = next_task.id
                   AND t.status = 'PENDING'
@@ -80,6 +86,7 @@ public class TaskRepository {
                 %s
                 """.formatted(taskColumns("t")))
                 .param("workerId", workerId)
+                .param("leaseMicros", leaseMicros)
                 .query(TASK_ROW_MAPPER)
                 .optional()
                 .orElse(null);
@@ -118,11 +125,39 @@ public class TaskRepository {
     }
 
     /**
-     * One update per transition. The {@code WHERE} clause is what makes the
-     * transition legal. An empty result means the row did not change; the
-     * service names that outcome and does not try the update again.
+     * Moves the lease forward and records a heartbeat. The guard is the
+     * task, {@code RUNNING}, the worker, and the attempt from claim. A past
+     * {@code lease_expires_at} still matches: expiry is not a new owner.
+     * {@code updated_at}, {@code attempt}, {@code status}, and
+     * {@code worker_id} stay as they were. Zero rows is {@code false}.
      */
-    public Optional<Task> completeTask(UUID id, UUID workerId, String result) {
+    public boolean extendLease(UUID id, UUID workerId, int attempt, long leaseMicros) {
+        return jdbcClient.sql("""
+                UPDATE tasks
+                SET lease_expires_at = NOW() + (:leaseMicros * INTERVAL '1 microsecond'),
+                    last_heartbeat_at = NOW()
+                WHERE id = :id
+                  AND status = 'RUNNING'
+                  AND worker_id = :workerId
+                  AND attempt = :attempt
+                RETURNING id
+                """)
+                .param("id", id)
+                .param("workerId", workerId)
+                .param("attempt", attempt)
+                .param("leaseMicros", leaseMicros)
+                .query((rs, rowNum) -> rs.getObject("id", UUID.class))
+                .optional()
+                .isPresent();
+    }
+
+    /**
+     * One update per transition. The {@code WHERE} clause is what makes the
+     * transition legal, including the attempt the worker claimed. An empty
+     * result means the row did not change; the service names that outcome
+     * and does not try the update again.
+     */
+    public Optional<Task> completeTask(UUID id, UUID workerId, int attempt, String result) {
         return jdbcClient.sql("""
                 UPDATE tasks
                 SET status = 'COMPLETED',
@@ -132,17 +167,19 @@ public class TaskRepository {
                 WHERE id = :id
                   AND status = 'RUNNING'
                   AND worker_id = :workerId
+                  AND attempt = :attempt
                 RETURNING
                 %s
                 """.formatted(TASK_COLUMNS))
                 .param("id", id)
                 .param("workerId", workerId)
+                .param("attempt", attempt)
                 .param("result", result)
                 .query(TASK_ROW_MAPPER)
                 .optional();
     }
 
-    public Optional<Task> failTask(UUID id, UUID workerId, String error) {
+    public Optional<Task> failTask(UUID id, UUID workerId, int attempt, String error) {
         return jdbcClient.sql("""
                 UPDATE tasks
                 SET status = 'FAILED',
@@ -152,11 +189,13 @@ public class TaskRepository {
                 WHERE id = :id
                   AND status = 'RUNNING'
                   AND worker_id = :workerId
+                  AND attempt = :attempt
                 RETURNING
                 %s
                 """.formatted(TASK_COLUMNS))
                 .param("id", id)
                 .param("workerId", workerId)
+                .param("attempt", attempt)
                 .param("error", error)
                 .query(TASK_ROW_MAPPER)
                 .optional();
@@ -191,7 +230,10 @@ public class TaskRepository {
                 "updated_at",
                 "claimed_at",
                 "finished_at",
-                "worker_id"
+                "worker_id",
+                "attempt",
+                "lease_expires_at",
+                "last_heartbeat_at"
         ).map(column -> prefix + column).collect(Collectors.joining(", "));
     }
 

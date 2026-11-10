@@ -15,9 +15,10 @@ public sealed interface TransitionResult
     }
 
     /**
-     * The update changed nothing because this worker had already moved the
-     * task to the same status. The stored result, error, and timestamps stay
-     * as they were.
+     * The update changed nothing because this worker and this attempt had
+     * already moved the task to the same status. A later attempt by the
+     * same worker is {@link Rejected}. The stored result, error, and
+     * timestamps stay as they were.
      */
     record AlreadyApplied(Task task) implements TransitionResult {
     }
