@@ -126,6 +126,18 @@ public class TaskService {
         return new CancelResult.NotCancellable(current.status());
     }
 
+    /**
+     * One reap batch in its own transaction. The timeout bounds a reap that
+     * waits on a table lock. Callers must not depend on the order of the result.
+     */
+    @Transactional(timeout = 5)
+    public List<ReapedTask> reapExpiredLeases(int batchSize) {
+        if (batchSize < 1) {
+            throw new IllegalArgumentException("batchSize must be at least 1");
+        }
+        return taskRepository.reapExpiredLeases(batchSize);
+    }
+
     /** Runs only for an applied finish, never after the zero-row read in {@link #classifyFinish}. */
     private void recordFinish(Task finished, AttemptOutcome outcome) {
         if (!taskAttemptRepository.recordFinish(finished.id(), finished.attempt(), outcome)) {

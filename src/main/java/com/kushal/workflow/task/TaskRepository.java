@@ -217,6 +217,64 @@ public class TaskRepository {
                 .optional();
     }
 
+    /**
+     * Returns up to {@code batchSize} {@code RUNNING} rows whose lease is
+     * before {@code NOW()} to {@code PENDING}, and closes each attempt as
+     * {@code LEASE_EXPIRED}, in one statement. Rows skipped by
+     * {@code SKIP LOCKED}, and rows dropped by the READ COMMITTED re-check,
+     * do not count against {@code LIMIT}: a batch is short only when fewer
+     * than {@code batchSize} expired rows could be locked.
+     * {@code ORDER BY r.id} only makes the result deterministic.
+     */
+    public List<ReapedTask> reapExpiredLeases(int batchSize) {
+        return jdbcClient.sql("""
+                WITH expired AS MATERIALIZED (
+                    SELECT id, worker_id, claimed_at
+                    FROM tasks
+                    WHERE status = 'RUNNING'
+                      AND lease_expires_at < NOW()
+                    ORDER BY lease_expires_at
+                    LIMIT :batchSize
+                    FOR UPDATE SKIP LOCKED
+                ),
+                requeued AS (
+                    UPDATE tasks t
+                    SET status = 'PENDING',
+                        worker_id = NULL,
+                        claimed_at = NULL,
+                        lease_expires_at = NULL,
+                        last_heartbeat_at = NULL,
+                        updated_at = NOW()
+                    FROM expired e
+                    WHERE t.id = e.id
+                      AND t.status = 'RUNNING'
+                      AND t.lease_expires_at < NOW()
+                    RETURNING t.id, t.attempt, e.worker_id, e.claimed_at
+                ),
+                recorded AS (
+                    INSERT INTO task_attempts (task_id, attempt, worker_id, started_at, ended_at, outcome)
+                    SELECT id, attempt, worker_id, claimed_at, NOW(), 'LEASE_EXPIRED'
+                    FROM requeued
+                    ON CONFLICT (task_id, attempt) DO UPDATE
+                        SET ended_at = EXCLUDED.ended_at,
+                            outcome = EXCLUDED.outcome
+                        WHERE task_attempts.outcome IS NULL
+                    RETURNING task_id
+                )
+                SELECT r.id, r.attempt, r.worker_id, (c.task_id IS NOT NULL) AS recorded
+                FROM requeued r
+                LEFT JOIN recorded c ON c.task_id = r.id
+                ORDER BY r.id
+                """)
+                .param("batchSize", batchSize)
+                .query((rs, rowNum) -> new ReapedTask(
+                        rs.getObject("id", UUID.class),
+                        rs.getInt("attempt"),
+                        rs.getObject("worker_id", UUID.class),
+                        rs.getBoolean("recorded")))
+                .list();
+    }
+
     private static String taskColumns(String alias) {
         String prefix = alias == null ? "" : alias + ".";
         return Stream.of(
