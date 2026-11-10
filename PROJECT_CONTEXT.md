@@ -107,8 +107,9 @@ reports the workerPool component DOWN. Hikari maximum-pool-size must
 be at least concurrency plus API headroom. Tests set
 engine.worker.enabled=false and build their own pool.
 
-Not implemented yet: attempt counter, leases, heartbeats, crash recovery,
-fencing, retries, idempotency, and workflow definitions. GitHub Actions
+Not implemented yet: heartbeats, crash recovery, retries, idempotency,
+and workflow definitions. The attempt counter, leases, and the attempt
+fence are M3.1 and M3.2 (see "Current milestone"). GitHub Actions
 runs `./mvnw verify`.
 
 Verified:
@@ -175,8 +176,11 @@ M1 is complete, including former roadmap M2 (the worker runtime) and the
 later idle-backoff and `workerPool` health work. Do not rebuild the task
 API, the executor, the pool, idle backoff, or the health indicator.
 
-Next milestone is M3, leases and heartbeats. It is not started. There is
-no `attempt` column, no `lease_expires_at`, and no heartbeat.
+Current milestone is M3, leases and heartbeats. M3.1 and M3.2 are in the
+tree: V5 adds `attempt`, `lease_expires_at`, and `last_heartbeat_at`,
+claim sets the lease and increments `attempt`, and `extendLease`,
+complete, and fail require the attempt. M3.3 (response fields) and M3.4
+(heartbeats) are in progress.
 
 M3 includes: set a lease and increment `attempt` on claim; extend the
 lease for the owning worker and attempt; abort the handler in-process
