@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -239,15 +240,33 @@ class LeaseHeartbeatTest {
     }
 
     @Test
-    void errorFromExecuteClosesTheWatchAndSkipsFinish() {
+    void errorFromExecuteClosesTheWatchThenFailsOnce() {
         TaskExecutor executor = executor(new ScriptedHandler("WORK", ctx -> {
             throw new AssertionError("handler error");
         }));
         taskService.toClaim(claimed("WORK", 2));
 
-        AssertionError thrown = assertThrows(AssertionError.class, () -> executor.runOnce(workerId));
+        assertTrue(executor.runOnce(workerId));
 
-        assertEquals("handler error", thrown.getMessage());
+        ManualScheduler.Tick tick = scheduler.onlyTick();
+        assertTrue(tick.isCancelled());
+        assertEquals(Boolean.FALSE, tick.mayInterruptIfRunning());
+        assertEquals(List.of(new Finish("fail", 2, true)), taskService.finishes);
+        tick.fire();
+        assertTrue(taskService.extendCalls.isEmpty());
+    }
+
+    @Test
+    void virtualMachineErrorFromExecuteClosesTheWatchAndSkipsFinish() {
+        OutOfMemoryError error = new OutOfMemoryError("test");
+        TaskExecutor executor = executor(new ScriptedHandler("WORK", ctx -> {
+            throw error;
+        }));
+        taskService.toClaim(claimed("WORK", 2));
+
+        OutOfMemoryError thrown = assertThrows(OutOfMemoryError.class, () -> executor.runOnce(workerId));
+
+        assertSame(error, thrown);
         ManualScheduler.Tick tick = scheduler.onlyTick();
         assertTrue(tick.isCancelled());
         assertEquals(Boolean.FALSE, tick.mayInterruptIfRunning());

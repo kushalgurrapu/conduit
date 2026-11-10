@@ -1,7 +1,9 @@
 package com.kushal.workflow.worker;
 
 import com.kushal.workflow.support.PostgresIntegrationTest;
+import com.kushal.workflow.task.AttemptOutcome;
 import com.kushal.workflow.task.Task;
+import com.kushal.workflow.task.TaskAttempt;
 import com.kushal.workflow.task.TaskRepository;
 import com.kushal.workflow.task.TaskService;
 import com.kushal.workflow.task.TaskStatus;
@@ -19,6 +21,7 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import javax.sql.DataSource;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -31,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -170,21 +174,65 @@ class TaskExecutorTest extends PostgresIntegrationTest {
     }
 
     @Test
-    void errorPropagatesAndLeavesTheTaskRunning() {
+    void errorIsFailedOnce() {
         UUID workerId = UUID.randomUUID();
         Task created = taskService.createTask("PROBE", "{}");
         probe.setAction(ctx -> {
             throw new Error("handler error");
         });
 
-        Error thrown = assertThrows(Error.class, () -> executor.runOnce(workerId));
+        assertTrue(executor.runOnce(workerId));
 
-        assertEquals("handler error", thrown.getMessage());
+        Task finished = require(created.id());
+        assertEquals(TaskStatus.FAILED, finished.status());
+        assertEquals("java.lang.Error: handler error", finished.error());
+        assertEquals(workerId, finished.workerId());
+        assertEquals(List.of(new TaskAttempt(
+                created.id(), 1, workerId, finished.claimedAt(),
+                finished.finishedAt(), AttemptOutcome.FAILED, "java.lang.Error: handler error")
+        ), taskService.getAttempts(created.id()));
+    }
+
+    @Test
+    void stackOverflowErrorIsFailedOnce() {
+        UUID workerId = UUID.randomUUID();
+        Task created = taskService.createTask("PROBE", "{}");
+        probe.setAction(ctx -> {
+            throw new StackOverflowError();
+        });
+
+        assertTrue(executor.runOnce(workerId));
+
+        Task finished = require(created.id());
+        assertEquals(TaskStatus.FAILED, finished.status());
+        assertEquals("java.lang.StackOverflowError", finished.error());
+        assertEquals(workerId, finished.workerId());
+        assertEquals(List.of(new TaskAttempt(
+                created.id(), 1, workerId, finished.claimedAt(),
+                finished.finishedAt(), AttemptOutcome.FAILED, "java.lang.StackOverflowError")
+        ), taskService.getAttempts(created.id()));
+    }
+
+    @Test
+    void outOfMemoryErrorPropagatesAndLeavesTheTaskRunning() {
+        UUID workerId = UUID.randomUUID();
+        Task created = taskService.createTask("PROBE", "{}");
+        OutOfMemoryError error = new OutOfMemoryError("test");
+        probe.setAction(ctx -> {
+            throw error;
+        });
+
+        OutOfMemoryError thrown = assertThrows(OutOfMemoryError.class, () -> executor.runOnce(workerId));
+
+        assertSame(error, thrown);
         Task current = require(created.id());
         assertEquals(TaskStatus.RUNNING, current.status());
         assertEquals(workerId, current.workerId());
         assertNull(current.finishedAt());
         assertNull(current.error());
+        assertEquals(List.of(new TaskAttempt(
+                created.id(), 1, workerId, current.claimedAt(), null, null, null)
+        ), taskService.getAttempts(created.id()));
     }
 
     @Test

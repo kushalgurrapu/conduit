@@ -120,6 +120,15 @@ public class TaskExecutor {
             log.warn("Task {} failed in the handler", claimed.id(), ex);
             finish(claimed, workerId, new TaskOutcome.Failed(failureMessage(ex)));
             return;
+        } catch (Error error) {
+            // A VirtualMachineError means the JVM may no longer work, so no
+            // finish is attempted. A StackOverflowError has already unwound.
+            if (error instanceof VirtualMachineError && !(error instanceof StackOverflowError)) {
+                throw error;
+            }
+            log.error("Task {} failed in the handler with an error", claimed.id(), error);
+            finish(claimed, workerId, new TaskOutcome.Failed(failureMessage(error)));
+            return;
         }
 
         if (outcome == null) {
@@ -204,12 +213,12 @@ public class TaskExecutor {
         return Thread.currentThread().isInterrupted();
     }
 
-    private static String failureMessage(Exception ex) {
-        String message = ex.getMessage();
+    private static String failureMessage(Throwable thrown) {
+        String message = thrown.getMessage();
         if (message == null || message.isEmpty()) {
-            return ex.getClass().getName();
+            return thrown.getClass().getName();
         }
-        return ex.getClass().getName() + ": " + message;
+        return thrown.getClass().getName() + ": " + message;
     }
 
     /**

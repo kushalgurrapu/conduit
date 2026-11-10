@@ -289,6 +289,24 @@ class WorkerPoolTest extends PostgresIntegrationTest {
     }
 
     @Test
+    void handlerErrorLeavesTheLoopAlive() throws Exception {
+        Task broken = taskService.createTask("ASSERTION_ERROR", "{}");
+        Task echo = taskService.createTask("ECHO", "{\"message\":\"after the error\"}");
+
+        pool = newPool(1, Duration.ofMillis(20), Duration.ofSeconds(5), Duration.ofMillis(20));
+        pool.start();
+        awaitTrue(() -> require(echo.id()).status().isTerminal(), "the task after the error did not finish");
+
+        Task failed = require(broken.id());
+        assertEquals(TaskStatus.FAILED, failed.status());
+        assertEquals("java.lang.AssertionError: handler error", failed.error());
+        assertEquals(TaskStatus.COMPLETED, require(echo.id()).status());
+        assertTrue(resultEqualsPayload(echo.id()));
+        assertEquals(1, pool.liveLoopCount());
+        assertEquals(0, pool.unexpectedExitCount());
+    }
+
+    @Test
     void idleMissesGrowAndResetAfterAClaim() throws Exception {
         WorkerProperties workerProperties = properties(
                 1, Duration.ofMillis(50), Duration.ofSeconds(2), Duration.ofMillis(20));
@@ -474,6 +492,24 @@ class WorkerPoolTest extends PostgresIntegrationTest {
         @Bean
         LatchHandler latchHandler() {
             return new LatchHandler();
+        }
+
+        @Bean
+        AssertionErrorHandler assertionErrorHandler() {
+            return new AssertionErrorHandler();
+        }
+    }
+
+    static final class AssertionErrorHandler implements TaskHandler {
+
+        @Override
+        public String type() {
+            return "ASSERTION_ERROR";
+        }
+
+        @Override
+        public TaskOutcome execute(TaskContext ctx) {
+            throw new AssertionError("handler error");
         }
     }
 
