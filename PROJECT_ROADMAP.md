@@ -1035,7 +1035,7 @@ The `attempt` column and the `attempt` guard on complete, fail, and lease extens
 | Logs | Docker `json-file` logging with size rotation. CloudWatch Logs only with an explicit retention period | CloudWatch log groups never expire by default | Unbounded CloudWatch logs |
 | Provisioning | Console or AWS CLI steps written down in `docs/aws-deployment.md` | Reproducible without adding a tool | CDK, CloudFormation. Terraform is the section C stretch |
 
-Record this table, and the options not chosen, as ADR 0005 when M15 starts.
+Record this table, and the options not chosen, as an ADR with the next free number when M15 starts.
 
 ### Cost controls
 
