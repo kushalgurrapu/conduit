@@ -4,7 +4,8 @@
 
 Accepted
 
-The decision is accepted. The mechanisms that deliver it (leases, recovery,
+The decision is accepted. Leases and heartbeats exist (M3). The
+mechanisms that would deliver at-least-once execution (recovery,
 retries, idempotency) are **not implemented yet**. See "Current
 implementation versus planned".
 
@@ -52,15 +53,28 @@ fail, and cancel. A worker loop claims a task, runs the handler with no
 connection held, and writes the outcome once. `POST /api/v1/tasks` creates
 a task; `GET` reads it until the status is terminal.
 
-**Not implemented:** leases, heartbeats, recovery of abandoned tasks,
-retries, and idempotency keys.
+Since M3, a claim is a lease. The claim statement sets
+`lease_expires_at` from the database clock plus `engine.lease.duration`
+(default 30s) and increments `attempt`. While a handler runs,
+`LeaseHeartbeat` extends that lease every
+`engine.lease.heartbeat-interval` (default 10s). A rejected extension
+sets `TaskContext.leaseLost()`, which asks the handler to stop. The
+handler may ignore it. ADR 0003 describes the `attempt` guard on those
+writes.
 
-A crash after claim, an interrupt during the handler, or a finish write
-that throws leaves the task `RUNNING`. Nothing in the engine puts that
-row back to `PENDING`. The code is not at-least-once. A stuck task is
-lost work until an operator requeues it by hand (ADR 0004) or until
-recovery exists (M4). At-least-once is still the target of that later
-work.
+**Not implemented:** recovery of abandoned tasks (a reaper or any other
+engine path from `RUNNING` back to `PENDING`), retries, and idempotency
+keys. Those are M4, M5, and M6.
+
+A lease that has expired is only a timestamp in the past. It is not lost
+ownership, and nothing reads it to requeue the row. A crash after claim,
+an interrupt during the handler, or a finish write that throws leaves
+the task `RUNNING` with a lease that soon expires. A garbage-collection
+pause or a slow heartbeat can also let the lease expire while the
+handler is alive. In every case the row stays `RUNNING`. The code is not
+at-least-once. A stuck task is lost work until an operator requeues it
+by hand (ADR 0004) or until recovery exists (M4). At-least-once is still
+the target of that later work.
 
 "The handler ran at most once" is this process's control flow. It is not
 a durability guarantee. A manual requeue, or a future reaper, runs the
@@ -87,10 +101,10 @@ handler again.
 
 ## Future implications
 
-- Leases and heartbeats will give the engine a way to notice that a worker
-  is gone.
-- Recovery will put abandoned tasks back into the queue, and retries will
-  bound how many times that happens.
+- Leases and heartbeats (M3) give the engine a timestamp after which a
+  worker may be gone. Nothing acts on that timestamp yet.
+- Recovery (M4) will put tasks with an expired lease back into the queue,
+  and retries will bound how many times that happens.
 - Idempotency support will give handlers a stable key per task and attempt
   to pass downstream.
 - Any later step type that calls outside services (for example HTTP) should

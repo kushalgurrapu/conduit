@@ -2,7 +2,7 @@
 
 This file is the milestone source of truth. Implement one milestone at a time. Re-inspect the repository first; code and tests override this document. Follow that milestone's definition of done, the decisions in section 1, and the "do NOT build" list in section 2. Follow the AI Development Rule in `PROJECT_CONTEXT.md`.
 
-**Next milestone: M3, leases and heartbeats.** M0 and M1 are complete. Roadmap M2 is not a milestone. Do not start M4 (crash recovery and fencing tests) inside M3. The verified snapshot is the next section. Section 0 is the 2026-10-02 audit and is not the current tree.
+**Next milestone: M4, crash recovery and fencing.** M0, M1, and M3 are complete. Roadmap M2 is not a milestone. Do not start M5 (retries) inside M4. The verified snapshot is the next section. Section 0 is the 2026-10-02 audit and is not the current tree.
 
 The original text of this file was written on 2026-10-02 from a read of the repo at that time. Git history of later commits was used in the 2026-10-12 reconciliation.
 
@@ -22,13 +22,17 @@ The original text of this file was written on 2026-10-02 from a read of the repo
 
 **Update (planning, 2026-10-16):** The M15 cloud target is AWS: one Graviton EC2 instance running Docker Compose, RDS for PostgreSQL, ECR, GitHub OIDC, SSM Parameter Store, and Caddy for TLS. Cost controls and a measured cost per million tasks are part of M15's definition of done. See "AWS target" under M15. This does not change M3 or any milestone before M15.
 
+**Update (M3.5, 2026-11-09):** M3 is complete. M3.3 (`94eb723`) added `attempt` and `leaseExpiresAt` to `TaskResponse`; `lastHeartbeatAt` is not on the response, and cancel of `RUNNING` is still `409`. M3.4 (`9dc1687`, then `881c65b`) added `LeaseHeartbeat`: one scheduler thread, one fixed-delay tick per in-flight task at `engine.lease.heartbeat-interval`, and `TaskContext.leaseLost()` when an extension returns false while the watch is open. The flag is a request the handler may ignore, and the built-in handlers do not check it. A tick that detects lease loss closes its watch. The executor closes the watch on every exit from `execute`, before the finish write. M3.5 synced ADR 0002, 0003, and 0004, the README, and `PROJECT_CONTEXT.md` with the code. Deviations from the M3 text below are in the table under M3. Recovery, the crash test, and the zombie proof are M4. The engine is still not at-least-once. On this machine, `.\mvnw.cmd -B verify` finished with BUILD SUCCESS: 130 tests, 0 failures, 0 errors, 0 skipped (2026-11-09).
+
 ---
 
-## Current state (verified 2026-10-12)
+## Current state (verified 2026-10-12, updated for M3 on 2026-11-09)
+
+The M3 lines in this section were checked against `main` at `881c65b` on 2026-11-09 (130 tests). The audit-base paragraph that follows is from the 2026-10-12 audit.
 
 Audit base: `main` at `8a9fef3`, tracking `origin/main`. Package `com.kushal.workflow`. Spring Boot 4.1.1, Java 25, Maven, PostgreSQL 16, Flyway V1–V4, Spring JDBC `JdbcClient`, JUnit 5, Testcontainers. CI is `.github/workflows/ci.yml` (`./mvnw -B verify`, Java 25, Temurin, 20-minute job timeout). This audit did not read GitHub's check results. On this machine, `.\mvnw.cmd -B verify` finished with BUILD SUCCESS: 90 tests, 0 failures, 0 errors, 0 skipped (2026-10-12).
 
-`PROJECT_CONTEXT.md` is the short context for a new coding session. This file is the milestone plan. ADR 0004 is the lifecycle spec. ADRs 0002 and 0003 are accepted targets that are not implemented.
+`PROJECT_CONTEXT.md` is the short context for a new coding session. This file is the milestone plan. ADR 0004 is the lifecycle spec. ADRs 0002 and 0003 are accepted. The `attempt` fence in ADR 0003 is implemented (M3). At-least-once recovery in ADR 0002 and the zombie proof are not (M4).
 
 ### Milestone status
 
@@ -37,8 +41,9 @@ Audit base: `main` at `8a9fef3`, tracking `origin/main`. Package `com.kushal.wor
 | M0 Foundation | Complete | Implementation, tests, and docs. V3, shared Testcontainers, skip-locked test, Compose, env-based datasource, ADRs 0001–0003, GitHub Actions. |
 | M1 Lifecycle, API, and workers | Complete | Implementation and tests. Includes the original M2 worker runtime, merged in commit `696080d` (2026-10-05). M1.0–M1.6 are in the tree. Idle backoff and `workerPool` health (`8a9fef3`, 2026-10-12) are part of this milestone. |
 | M2 Worker runtime | Merged into M1 | Not a milestone. Do not schedule it and do not implement it again. |
-| M3 Leases and heartbeats | M3.2 in the tree | V5 and the claim lease are in place. `extendLease` moves the lease for the owning worker and attempt. Complete and fail require that attempt. Heartbeats, response fields, and the docs sync are not built yet. |
-| M4–M16 | Not started | Recovery, fencing proof, retries, idempotency, workflows, and everything after them. |
+| M3 Leases and heartbeats | Complete | Implementation, tests, and docs. M3.1–M3.5 (M3.3 `94eb723`, M3.4 `9dc1687` and `881c65b`, docs 2026-11-09). V5, the claim lease and `attempt`, `extendLease`, the attempt guard on complete and fail, `attempt` and `leaseExpiresAt` on `TaskResponse`, and `LeaseHeartbeat` with `TaskContext.leaseLost()`. Deviations are in the table under M3. |
+| M4 Crash recovery and fencing | Next. Not started | Reaper, `task_attempts`, crash and zombie tests. |
+| M5–M16 | Not started | Retries, idempotency, workflows, and everything after them. |
 
 ### Numbering (do not renumber)
 
@@ -48,37 +53,38 @@ M1.0 merged the worker runtime into M1 and kept M3 and later numbers so ADR refe
 
 Fencing is split on purpose, and that split stays:
 
-- **M3** adds `attempt`, increments it only on claim, and puts `attempt` on the worker write guard (extend, complete, fail). ADR 0003 and the M3 tasks say this. ADR 0004's future-implications section says the same.
-- **M4** adds the reaper (`RUNNING` back to `PENDING`) and the crash and zombie tests. Those tests are what show a stale attempt cannot finish after a later claim. M3 must not build the reaper. The M4 section also repeats the `attempt` guard; that guard is M3 work, and M4 should find it already present.
+- **M3** added `attempt`, increments it only on claim, and put `attempt` on the worker write guard (extend, complete, fail). ADR 0003 and the M3 tasks say this. ADR 0004's future-implications section says the same. M3 tested the guard with the same worker and a different attempt, including a test-only requeue.
+- **M4** adds the reaper (`RUNNING` back to `PENDING`) and the crash and zombie tests. Those tests are what show a stale attempt cannot finish after a later claim by another worker. M3 did not build the reaper. The M4 section also repeats the `attempt` guard; that guard is M3 work, and M4 will find it already present.
 
 ### Implemented and tested
 
 Evidence is the code and the test classes named in the README "How this is tested" section. A passing test name is not treated as proof unless that test is in the tree.
 
-- **Schema.** V1 creates `tasks`. V2 drops the `claimed_at` default. V3 converts timestamps to `timestamptz`, adds `updated_at`, `tasks_status_check`, and `idx_tasks_pending`. V4 adds `task_type`, `result`, `error`, `finished_at`, backfills legacy rows, and adds the four named checks. A `RUNNING` row with no owner fails V4 rather than being repaired. V5 (M3.1) adds `lease_expires_at`, `attempt` (default 0), and `last_heartbeat_at`, backfills a running lease from `claimed_at`, and replaces `tasks_running_has_owner_check` so `RUNNING` also requires `lease_expires_at`.
+- **Schema.** V1 creates `tasks`. V2 drops the `claimed_at` default. V3 converts timestamps to `timestamptz`, adds `updated_at`, `tasks_status_check`, and `idx_tasks_pending`. V4 adds `task_type`, `result`, `error`, `finished_at`, backfills legacy rows, and adds the four named checks. A `RUNNING` row with no owner fails V4 rather than being repaired. V5 (M3.1) adds `lease_expires_at`, `attempt` (default 0), and `last_heartbeat_at`, backfills a running lease from `claimed_at` (so it is already expired, and the row stays `RUNNING`), replaces `tasks_running_has_owner_check` so `RUNNING` also requires `lease_expires_at`, and adds `idx_tasks_running_lease`. No query uses that index yet. Apply V5 with the process stopped.
 - **Lifecycle.** `PENDING → RUNNING` (claim), `RUNNING → COMPLETED` or `FAILED` (owning `worker_id` and the attempt from that claim), `PENDING → CANCELLED`. No engine path from `RUNNING` back to `PENDING`. `TaskStatus` has `isTerminal()` only. The `WHERE` clause is the state machine. Complete and fail do not require an unexpired lease.
-- **Claim.** `FOR UPDATE SKIP LOCKED`, then an update that requires `PENDING` again, sets `worker_id`, `claimed_at`, and `updated_at`, and returns the mapped columns. M3.1 also sets `lease_expires_at` from `leaseMicros`, increments `attempt`, and clears `last_heartbeat_at`. A null worker id is rejected in Java. An empty queue returns null.
+- **Claim.** `FOR UPDATE SKIP LOCKED`, then an update that requires `PENDING` again, sets `worker_id`, `claimed_at`, and `updated_at`, and returns the mapped columns. M3.1 also sets `lease_expires_at = NOW() + (:leaseMicros * INTERVAL '1 microsecond')` from `engine.lease.duration`, increments `attempt`, and clears `last_heartbeat_at`. Nothing else increments `attempt`. A null worker id is rejected in Java. An empty queue returns null.
 - **Lease extension.** `extendLease` is one update. The guard is `id`, `RUNNING`, `worker_id`, and `attempt`. It sets `lease_expires_at` from `leaseMicros` and `last_heartbeat_at` to `NOW()`. It does not change `updated_at`, status, worker, or attempt. A past lease still matches. Zero rows is `false` and is not retried.
 - **Finish and cancel.** One update each. Complete and fail also require `attempt`. Zero rows is classified and not retried. `AlreadyApplied` is the same worker, the same attempt, and the target status. A different attempt is `Rejected`. Cancel of a missing id throws `TaskNotFoundException`. Cancel does not take an attempt.
-- **API.** `POST /api/v1/tasks` (`201`, `Location`, `TaskResponse`), `GET /api/v1/tasks/{id}` (`200` or `404`), `POST /api/v1/tasks/{id}/cancel` (`200` pending or already cancelled, `409` running or other terminal, `404` missing). `taskType` is format-checked only. Errors are RFC 9457 `ProblemDetail`. There is no list, retry, claim, complete, or fail endpoint. `POST /tasks` and `POST /tasks/claim` are gone.
-- **Workers.** `TaskExecutor.runOnce` is one claim, one handler call with no transaction and no pooled connection, and one finish write. The finish uses the attempt on the claimed task. There is no heartbeat scheduler yet. `NOOP`, `ECHO`, `FAIL`, and `SLEEP` are always registered. `WorkerPool` runs `engine.worker.concurrency` platform threads (default 4) when `engine.worker.enabled` is true. Each loop has one UUID. Empty claims wait with exponential delay and equal jitter (`IdleBackoff`). Shutdown stops new claims, finishes a claimed task, and interrupts a handler still running at `shutdown-timeout` (default 20s), leaving that task `RUNNING`.
+- **API.** `POST /api/v1/tasks` (`201`, `Location`, `TaskResponse`), `GET /api/v1/tasks/{id}` (`200` or `404`), `POST /api/v1/tasks/{id}/cancel` (`200` pending or already cancelled, `409` running or other terminal, `404` missing). `TaskResponse` includes `workerId`, `attempt`, and `leaseExpiresAt`, and not `lastHeartbeatAt`. `taskType` is format-checked only. Errors are RFC 9457 `ProblemDetail`. There is no list, retry, claim, complete, or fail endpoint. `POST /tasks` and `POST /tasks/claim` are gone.
+- **Workers.** `TaskExecutor.runOnce` is one claim, one handler call with no transaction and no pooled connection, and one finish write. The finish uses the attempt on the claimed task. `NOOP`, `ECHO`, `FAIL`, and `SLEEP` are always registered. `WorkerPool` runs `engine.worker.concurrency` platform threads (default 4) when `engine.worker.enabled` is true. Each loop has one UUID. Empty claims wait with exponential delay and equal jitter (`IdleBackoff`). Shutdown stops new claims, finishes a claimed task, and interrupts a handler still running at `shutdown-timeout` (default 20s), leaving that task `RUNNING`.
+- **Heartbeats (M3.4).** `LeaseHeartbeat` runs one scheduler thread and one fixed-delay tick per in-flight task at `engine.lease.heartbeat-interval`. Defaults are a 30s lease and a 10s interval. Startup rejects a value under one microsecond and an interval that is not shorter than the lease. Heartbeat every lease/3 is a heuristic, not a proved constant. A false extend while the watch is open sets `TaskContext.leaseLost()` and closes that watch. The flag is a request the handler may ignore; the built-in handlers do not check it. An exception from a tick, including a data-access error, is logged and is not lease loss. An `Error` is logged and rethrown, which stops that task's ticks. The executor closes the watch on every exit from `execute`, before the finish write, so a finished task's late tick does not flag loss. If the heartbeat has already stopped, `start` returns a closed watch and logs a warning. Phase `-1` stops the heartbeat after `WorkerPool`. Hikari needs worker concurrency + API headroom + 1.
 - **Health.** `/actuator/health` includes `workerPool`. It is worker-loop readiness only: `UP` when workers are disabled, or when the pool is running and `liveLoops` equals `concurrency` with no unexpected exit. `OUT_OF_SERVICE` while stopped, stopping, or not yet fully live. `DOWN` after a loop exits while the pool is still started. It does not mean the database is reachable or that tasks are moving. Do not assume `workerPool` is the only health contributor.
-- **Tests in the tree.** Concurrent claim, skip-locked, guarded transitions, lease extension and the attempt fence, cancel-versus-claim lock hold, V4 migration, V5 migration, claim `updated_at`, lease properties, executor, handler configuration, worker pool (including shutdown, idle reset, a 1,000-task run, and health), idle backoff, worker properties, health-indicator table, and the HTTP API. Integration tests extend `PostgresIntegrationTest` (one Testcontainers PostgreSQL, workers off, `DELETE FROM tasks` before each test) except `V4MigrationTest` and `V5MigrationTest`, which use their own databases.
+- **Tests in the tree.** Concurrent claim, skip-locked, guarded transitions, lease extension and the attempt fence, cancel-versus-claim lock hold, V4 migration, V5 migration, claim `updated_at` and the claim lease, lease properties, heartbeat unit tests on a hand-fired scheduler (`LeaseHeartbeatTest`), heartbeats against PostgreSQL with a 1s lease (`LeaseHeartbeatIntegrationTest`), executor, handler configuration, worker pool (including shutdown, idle reset, a 1,000-task run, and health), idle backoff, worker properties, health-indicator table, and the HTTP API including `attempt` and `leaseExpiresAt`. Integration tests extend `PostgresIntegrationTest` (one Testcontainers PostgreSQL, workers off, `DELETE FROM tasks` before each test) except `V4MigrationTest` and `V5MigrationTest`, which use their own databases. `LeaseHeartbeatIntegrationTest` has its own Spring context.
 
 ### Not implemented
 
-Heartbeats, `TaskContext` lease loss, `attempt` and `leaseExpiresAt` on `TaskResponse`, crash recovery, a reaper, the crash and zombie proofs, retries, idempotency keys, workflow definitions, scheduling, auth, OpenAPI, and a list endpoint. Claim stores `attempt` and a lease (M3.1). `extendLease` and the attempt guard on complete and fail are in the tree (M3.2). A crash after claim, an interrupt during the handler, or a finish write that throws leaves the task `RUNNING`. That is lost work until an operator requeues by hand or until M4. The engine is not at-least-once today (ADR 0002).
+Crash recovery, a reaper, the crash and zombie proofs, `task_attempts`, retries, idempotency keys, workflow definitions, scheduling, auth, OpenAPI, and a list endpoint. A crash after claim, an interrupt during the handler, or a finish write that throws leaves the task `RUNNING`. Its lease expires and nothing acts on that. One slow JDBC call on the heartbeat thread delays every tick. A GC pause can let a lease expire while the handler is alive. An expired lease is not lost ownership, and nothing requeues the row. That is lost work until an operator requeues by hand or until M4. The engine is not at-least-once today (ADR 0002).
 
 ### Known behavior that is not a reason to reopen M1
 
-- A worker-loop `Exception` that is not a `DataAccessException` or `TransactionException` is logged and the loop continues immediately. `error-backoff` applies only to those database and transaction failures. No test asserts a pause for other exceptions. This does not block M3.
+- A worker-loop `Exception` that is not a `DataAccessException` or `TransactionException` is logged and the loop continues immediately. `error-backoff` applies only to those database and transaction failures. No test asserts a pause for other exceptions. This does not block M4.
 - `TaskExecutor` puts `taskId`, `workerId`, and `taskType` in MDC for one cycle. Structured JSON logging, metrics, and tracing are still M11. Do not rebuild the `workerPool` health component as if it were missing.
-- HTTP cancel of a `RUNNING` task is `409`. ADR 0004 says a cooperative cancel of a running task waits until M3. The M3 task list is the heartbeat-loss signal (`extendLease` returns false, then `TaskContext` asks the handler to stop). It does not change `POST /api/v1/tasks/{id}/cancel`. Keep that HTTP contract in M3 unless a planning session changes it on purpose. There is still no wall-clock handler timeout.
+- HTTP cancel of a `RUNNING` task is `409`. The only cooperative signal M3 built is heartbeat loss (`extendLease` returns false, then `TaskContext.leaseLost()` asks the handler to stop). It did not change `POST /api/v1/tasks/{id}/cancel`. Keep that HTTP contract unless a planning session changes it on purpose. There is still no wall-clock handler timeout.
 - A dead loop stays dead. Nothing starts a replacement. Restart the process.
 
 ### Local plan file
 
-`.plans/` is gitignored. The M1 plan in that directory is a completed historical plan. A fresh clone will not have it. Do not treat it as the spec for new work.
+`.plans/` is gitignored. The M1 and M3 plans in that directory are completed historical plans. A fresh clone will not have them. Do not treat them as the spec for new work.
 
 ---
 
@@ -418,9 +424,30 @@ The worker pool ships with the lifecycle and the REST API. The original goal sti
 
 ## M3. Leases and heartbeats
 
-**Status:** not started. This is the next milestone.
+**Status:** complete (M3.1–M3.5, 2026-11-09). Do not reopen it. The "Start here" block and the task list below are the text written before M3. Where they disagree with the deviations table, the table and the code win.
 
 **Complexity:** Medium. **Time:** 1.5-2 weeks. **Depends on:** M1 (the worker runtime is part of M1).
+
+### Recorded deviations (M3)
+
+These replace the M3 and M4 text in this file where they conflict. ADR 0003 and ADR 0004 describe the result.
+
+| Roadmap says | M3 does | Why |
+| --- | --- | --- |
+| Lease is `now() + :leaseSeconds` | `NOW() + (:leaseMicros * INTERVAL '1 microsecond')`, with `leaseMicros = duration.toNanos() / 1_000`. Approved 2026-10-13 | A sub-second `Duration` must not become a zero lease. Startup rejects a duration under one microsecond |
+| M4 names `LeaseLostException` | Zero rows stays `TransitionResult` on complete and fail, and a `boolean` on extend | The M3 text itself says zero rows is a value |
+| `last_heartbeat_at` is a column only | Stored on `Task`, omitted from `TaskResponse` | The API change is `attempt` and `leaseExpiresAt` |
+| Extend guard is id, `RUNNING`, worker, attempt | Same guard, and a lease already in the past still extends | M3 has no reaper, so an old timestamp is not a new owner |
+| `AlreadyApplied` is the same worker and the target status | Also the same `attempt` | A later attempt by the same `worker_id` must be `Rejected` |
+| Failure mode: abort the handler when the lease time passes | Lease loss is only a `false` extension while the watch is open | A Java clock check races. ADR 0003 puts the check in the write |
+| Extension failure signals the handler to abort | `TaskContext.leaseLost()` is a request. The handler may ignore it, and the built-in handlers do not check it. A returned outcome still gets one finish write, which the attempt guard decides | Java cannot preempt a handler. Interrupting it from the heartbeat thread was rejected |
+| DB blip: retry the heartbeat within the remaining lease | No retry inside a tick. An exception is logged, is not lease loss, and the next tick tries again | One tick, one statement. A retry loop on the shared thread would delay every other task |
+| M4 reaper clears `worker_id`, `claimed_at`, `lease_expires_at` | M4 must also clear `last_heartbeat_at` | Otherwise a `PENDING` row carries a heartbeat for a task nobody holds. Not built in M3 |
+| Hikari pool ≥ concurrency + API headroom (M1 table) | Concurrency + API headroom + 1 | Heartbeats borrow one connection from the same pool |
+| (M3.4 plan) Heartbeat `start` always schedules a tick | If the heartbeat has already stopped, `start` returns a closed watch and logs a warning. The handler runs without lease extension | The scheduler rejects new ticks once it has shut down. A claimed task is still executed, which is the shutdown rule in ADR 0004 |
+| (M3.4 plan) A false extend sets `leaseLost()` and later ticks keep running | A tick that detects lease loss closes its watch, so later ticks do not run (`881c65b`) | In production a guard that stopped matching cannot match again: `attempt` only increases and terminal states stay terminal |
+| (M3.4 plan) A tick catches `Exception` and lets `Error` propagate | An `Error` is logged and then rethrown | The scheduler drops the failed periodic task silently. The log line is the only trace |
+| (M3.4 plan) The no-heartbeat test uses a second executor with a no-op heartbeat | It uses a real `LeaseHeartbeat` on a scheduler that never fires | No heartbeat interface was added just for the test |
 
 ### Start here
 
@@ -498,11 +525,11 @@ Write a short implementation plan in a later session if you want one. This secti
 
 ## M4. Crash recovery and fencing
 
-**Status:** not started. Do not begin this milestone while implementing M3.
+**Status:** not started. This is the next milestone. M3 is complete.
 
 **Complexity:** Large. **Time:** 2-3 weeks. **Depends on:** M3.
 
-The `attempt` column and the `attempt` guard on complete, fail, and lease extension are M3. This milestone should find them already present. Its own work is the reaper and the tests that prove a stale attempt cannot finish after a later claim. The reaper must clear `worker_id`, `claimed_at`, and `lease_expires_at` together (`tasks_pending_has_no_owner_check`).
+The `attempt` column and the `attempt` guard on complete, fail, and lease extension are M3, and they are in the tree. This milestone's own work is the reaper and the tests that prove a stale attempt cannot finish after a later claim. The reaper must clear `worker_id`, `claimed_at`, `lease_expires_at`, and `last_heartbeat_at` together, and leave `attempt` alone (`tasks_pending_has_no_owner_check` for the owner fields; see the M3 deviations table for `last_heartbeat_at`). `idx_tasks_running_lease` already exists for the reaper's query.
 
 **Goal**
 - Tasks held by dead workers return to the queue automatically.
@@ -516,9 +543,9 @@ The `attempt` column and the `attempt` guard on complete, fail, and lease extens
 - Alternative design: reclaim expired leases inside the claim query ("lazy reclaim"). Record the chosen approach in an ADR. Recommended: an explicit reaper, because it gives visibility and metrics.
 
 **Implementation tasks**
-- `LeaseReaper` (`@Scheduled`, or its own loop) running `UPDATE tasks SET status='PENDING', worker_id=NULL, claimed_at=NULL, lease_expires_at=NULL ... WHERE id IN (SELECT id FROM tasks WHERE status='RUNNING' AND lease_expires_at < now() ORDER BY lease_expires_at LIMIT :batch FOR UPDATE SKIP LOCKED) RETURNING id`. M1's `tasks_pending_has_no_owner_check` requires a `PENDING` row to have a null `claimed_at`, so the reaper must clear `claimed_at` as well as `worker_id` and `lease_expires_at`.
+- `LeaseReaper` (`@Scheduled`, or its own loop) running `UPDATE tasks SET status='PENDING', worker_id=NULL, claimed_at=NULL, lease_expires_at=NULL, last_heartbeat_at=NULL ... WHERE id IN (SELECT id FROM tasks WHERE status='RUNNING' AND lease_expires_at < now() ORDER BY lease_expires_at LIMIT :batch FOR UPDATE SKIP LOCKED) RETURNING id`. M1's `tasks_pending_has_no_owner_check` requires a `PENDING` row to have a null `claimed_at`, so the reaper must clear `claimed_at` as well as `worker_id` and `lease_expires_at`. It must also clear `last_heartbeat_at` (M3 deviations table). It must not change `attempt`.
 - Confirm the M3 guard is still present: every completion, failure, and lease extension carries `attempt` in the `WHERE` clause, so a stale worker's write affects 0 rows. Do not treat a missing guard as new M4 design; it is unfinished M3.
-- Worker handles "0 rows updated" as `LeaseLostException`: log, discard the result, and do not retry the write.
+- Worker handles "0 rows updated" as `LeaseLostException`: log, discard the result, and do not retry the write. M3 kept zero rows as a value (`TransitionResult.Rejected` on finish, `false` on extend, then `TaskContext.leaseLost()`), and `TaskExecutor` already logs a rejected finish and does not retry. Decide in M4 whether an exception adds anything.
 - Record each reclaim in a `task_attempts` row (see below).
 - Config: `engine.reaper.interval`, `batch-size`.
 - Test hooks: a `FaultInjection` helper in test code to pause or kill a worker's heartbeats/threads.

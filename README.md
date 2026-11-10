@@ -108,8 +108,10 @@ POST /api/v1/tasks/{id}/cancel
 accepted. The worker fails that task later. JSON null and a NUL byte in
 a key or a text value are `400`.
 
-`GET /api/v1/tasks/{id}` returns the task, including `workerId` and
-`claimedAt`, or `404`.
+`GET /api/v1/tasks/{id}` returns the task, including `workerId`,
+`claimedAt`, `attempt`, and `leaseExpiresAt`, or `404`. A task that has
+never been claimed shows `attempt` `0` and `leaseExpiresAt` null. The
+response does not include `last_heartbeat_at`.
 
 `POST /api/v1/tasks/{id}/cancel` returns `200` when the task is `PENDING`
 or already `CANCELLED`, `409` when it is `RUNNING` or another terminal
@@ -148,7 +150,8 @@ applies only while the task is still `PENDING`. On Windows, PowerShell's
 ### Service
 
 `TaskService` contains application-level logic and owns the transaction
-boundary for claiming a task and for complete, fail, and cancel.
+boundary for claiming a task, extending its lease, and for complete,
+fail, and cancel.
 
 The important distinction is:
 
@@ -171,8 +174,11 @@ PostgreSQL.
 It currently handles:
 
 -   inserting tasks
--   atomically claiming pending tasks
--   completing or failing a running task for its owning worker
+-   atomically claiming pending tasks, which sets a lease and increments
+    `attempt`
+-   extending the lease of a running task for its worker and attempt
+-   completing or failing a running task for its owning worker and
+    attempt
 -   cancelling a pending task
 
 ## Task Model
@@ -191,6 +197,9 @@ updated_at  timestamptz, set again on every write
 claimed_at  timestamptz, null while the task is pending
 finished_at timestamptz, set only when the task is terminal
 worker_id   uuid, null while the task is pending
+attempt     int, 0 until the first claim; only claim increments it
+lease_expires_at  timestamptz, set by claim, moved by heartbeats
+last_heartbeat_at timestamptz, null until the first heartbeat of a claim
 ```
 
 `TaskStatus` is `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, or
@@ -199,9 +208,10 @@ not decide which transition is legal. Each write is one `UPDATE`, and
 its `WHERE` clause is the rule:
 
 ``` text
-claim    PENDING  -> RUNNING     for one worker
-complete RUNNING -> COMPLETED    only that worker
-fail     RUNNING -> FAILED       only that worker
+claim    PENDING  -> RUNNING     for one worker, attempt + 1, new lease
+extend   RUNNING  -> RUNNING     only that worker and attempt
+complete RUNNING -> COMPLETED    only that worker and attempt
+fail     RUNNING -> FAILED       only that worker and attempt
 cancel   PENDING -> CANCELLED
 ```
 
@@ -210,8 +220,9 @@ stateDiagram-v2
     [*] --> PENDING: create
     PENDING --> RUNNING: claim
     PENDING --> CANCELLED: cancel
-    RUNNING --> COMPLETED: complete, owning worker
-    RUNNING --> FAILED: fail, owning worker
+    RUNNING --> RUNNING: extend lease, owning worker and attempt
+    RUNNING --> COMPLETED: complete, owning worker and attempt
+    RUNNING --> FAILED: fail, owning worker and attempt
     COMPLETED --> [*]
     FAILED --> [*]
     CANCELLED --> [*]
@@ -227,7 +238,9 @@ write again. Complete and fail are not HTTP operations. Cancel is
 
 Calling complete again with a different result does not overwrite the
 first result. The second call is "already applied" when the same worker
-already reached that status.
+and the same attempt already reached that status. A different attempt
+is rejected, even from the same worker. Complete and fail do not
+require the lease to be unexpired.
 
 There is no engine path from `RUNNING` back to `PENDING`. An operator can
 requeue by hand, and only by pinning the worker they observed. That
@@ -242,6 +255,11 @@ WHERE id = :id
   AND status = 'RUNNING'
   AND worker_id = :observedWorkerId;
 ```
+
+That statement leaves `attempt`, `lease_expires_at`, and
+`last_heartbeat_at` on the `PENDING` row. The next claim increments
+`attempt`, replaces the lease, and clears the heartbeat, so the old
+attempt's writes are rejected.
 
 `TaskExecutor.runOnce` is one claim, one handler call, and one finish
 write. `WorkerPool` calls it from a fixed number of platform threads
@@ -311,17 +329,21 @@ replacement. Details include `enabled`, `running`, `stopping`,
 `concurrency`, `liveLoops`, and `unexpectedExits`.
 
 Hikari `maximum-pool-size` (default 10) must be at least
-`engine.worker.concurrency` plus headroom for API requests. A handler
-does not hold a connection, so the pool is not sized as one connection
-per running handler. Nothing checks that size at startup.
+`engine.worker.concurrency` plus headroom for API requests plus one for
+the lease-heartbeat thread. A handler does not hold a connection, so the
+pool is not sized as one connection per running handler. Nothing checks
+that size at startup.
 
 A caller of `runOnce` does three things:
 
-1.  Claim one pending task, in a transaction.
+1.  Claim one pending task, in a transaction. That sets the lease and
+    the attempt.
 2.  Run the handler for that `task_type` with no transaction and no
-    database connection.
-3.  Write the outcome once: complete, or fail. If that write throws, the
-    task stays `RUNNING`. There is no second attempt.
+    database connection. Heartbeats extend the lease meanwhile, on their
+    own thread and connection.
+3.  Write the outcome once: complete, or fail, with the claimed attempt.
+    If that write throws, the task stays `RUNNING`. There is no second
+    attempt.
 
 Handlers are always registered: `NOOP` completes and stores JSON null,
 `ECHO` stores the payload as the result, `FAIL` fails (a textual
@@ -336,6 +358,51 @@ two handlers use the same type, or if a type does not match the
 
 The HTTP API is the controller section above. Further states may be
 introduced later if they are justified by the workflow requirements.
+
+### Leases and heartbeats
+
+A claim is a lease. The claim statement sets `lease_expires_at` to the
+database's `NOW()` plus `engine.lease.duration`, written as
+`NOW() + (:leaseMicros * INTERVAL '1 microsecond')` so a sub-second
+duration does not round to zero. The same statement increments
+`attempt` and clears `last_heartbeat_at`. Nothing else increments
+`attempt`.
+
+While a handler runs, `LeaseHeartbeat` extends that lease from one
+shared scheduler thread. Each in-flight task gets one fixed-delay tick
+every `engine.lease.heartbeat-interval`, starting one interval after the
+handler starts. A tick is one guarded update (`id`, `RUNNING`,
+`worker_id`, `attempt`) that moves `lease_expires_at` and sets
+`last_heartbeat_at`. A lease already in the past still extends when the
+guard matches.
+
+-   If the update matches nothing while the task is still running,
+    `TaskContext.leaseLost()` becomes `true` and that task's ticks stop.
+    This is a request to stop. Nothing interrupts the handler, and it
+    may ignore the flag. The built-in handlers do not check it. If the
+    handler returns an outcome, that outcome still gets its one finish
+    write, and the attempt guard rejects it if the attempt changed.
+-   A tick that throws an exception, such as a data-access error, is
+    logged and is not lease loss. The next tick tries again.
+-   The executor closes the task's watch on every exit from the handler,
+    before the finish write. A tick that runs after that does nothing,
+    so a finished task's late tick does not flag lease loss.
+
+`engine.lease` settings, with the defaults from `application.yaml`:
+
+-   `duration` (`30s`): how long a claim or a heartbeat makes the lease.
+-   `heartbeat-interval` (`10s`): the delay between ticks for one task.
+
+Startup fails if either value is under one microsecond, or if the
+interval is not shorter than the duration. Heartbeat every lease/3 is a
+starting heuristic, not a proved constant. An interval longer than a
+third of the lease still starts. A shorter lease would let an M4 reaper
+notice a dead worker sooner, and would also make a false expiry more
+likely. Nothing acts on an expiry yet.
+
+A lease that expires is only a timestamp. Nothing in M3 reads it.
+Nothing requeues the row, and the worker that holds it can still extend,
+complete, or fail it. Cancel of a `RUNNING` task is still `409`.
 
 ## Guarantees
 
@@ -368,16 +435,43 @@ at-least-once delivery.
     the worker that was observed. The handler may already have run, and
     it may run again.
 
-M1 does not provide, and this document does not claim:
+M3 adds these. They match ADR 0003 and ADR 0004:
+
+1.  One claim statement sets `lease_expires_at` from `NOW()` plus the
+    configured duration, increments `attempt` by one, and clears
+    `last_heartbeat_at`. No other production statement increments
+    `attempt`.
+2.  Lease extension, complete, and fail apply only when `id`,
+    `RUNNING`, `worker_id`, and `attempt` all match. A mismatch writes
+    nothing. The same worker with a different attempt is rejected while
+    the row is still `RUNNING`.
+3.  Complete and fail do not require an unexpired lease, do not clear
+    the lease columns, and are not written again after zero rows or a
+    thrown database error.
+4.  A handler that keeps getting successful heartbeats stays `RUNNING`
+    past the original lease, and `lease_expires_at` moves forward.
+5.  `RUNNING` requires `worker_id`, `claimed_at`, and
+    `lease_expires_at` (one replaced `tasks_running_has_owner_check`).
+6.  The heartbeat watch stops on every exit from the handler, including
+    an interrupt and an `Error`, before the finish write.
+
+Neither M1 nor M3 provides, and this document does not claim:
 
 -   exactly-once execution
 -   at-least-once execution (that is ADR 0002, after recovery in M4)
--   automatic recovery or a reaper
+-   automatic recovery or a reaper. An expired lease stays on a
+    `RUNNING` row
+-   that an expired lease means another worker owns the task
+-   that a handler stops when `leaseLost()` becomes `true`. The built-in
+    handlers do not check it
+-   that a garbage-collection pause or a stalled heartbeat thread is
+    detected as lease loss
 -   that a returned outcome always commits (`RUNNING` after a failed
     finish write is allowed)
--   rejection of a stale writer from a **later** claim that reuses the
-    same `worker_id`. The `attempt` guard is M3 (ADR 0003). A later
-    claim exists only after M4 recovery
+-   the zombie proof: a worker that resumes after **another** worker
+    claimed the task through recovery. The `attempt` guard exists (ADR
+    0003), and tests exercise it with a test-only requeue. A later claim
+    happens in production only after M4 recovery
 -   handler timeouts or detection of a hung worker
 -   task-level retries
 
@@ -389,7 +483,20 @@ are second invocations.
 
 -   **Stuck `RUNNING`.** A crash after claim, an interrupt during the
     handler, or a finish write that throws leaves the task `RUNNING`.
-    The pool does not claim that row again.
+    Its lease expires, and nothing acts on that. The pool does not claim
+    that row again.
+-   **An expired lease is not lost ownership.** A handler that never
+    heartbeats, or that ignores `leaseLost()`, can leave an expired
+    lease on a `RUNNING` row. Its worker can still extend, complete, or
+    fail it. Nothing requeues it until M4.
+-   **One heartbeat thread.** Every in-flight task's tick runs on the
+    same thread. One slow JDBC call delays every other task's tick. That
+    is not lease loss, and a long enough delay lets other leases expire.
+-   **Pauses.** A garbage-collection pause can let a lease expire while
+    the handler is alive. Nothing signals that to the handler.
+-   **Shutdown.** Heartbeats continue while shutdown waits for in-flight
+    handlers, then the heartbeat scheduler stops. A handler that ignores
+    the interrupt can keep running with a lease that no longer moves.
 -   **Legacy `RUNNING` rows.** `POST /tasks/claim` used to claim a task
     and leave it `RUNNING`, because nothing finished it. Those rows stay
     `RUNNING`. V4 does not repair them. A `RUNNING` row with no owner
@@ -442,6 +549,17 @@ Flyway migrations in `src/main/resources/db/migration` build the schema:
     `engine.worker.enabled=true` (the default), the pool does that while
     the application is running. Tests set the flag to false so they can
     claim rows themselves.
+-   `V5` adds `lease_expires_at`, `attempt` (default `0`), and
+    `last_heartbeat_at`. Existing `RUNNING` rows get
+    `lease_expires_at = claimed_at`, so their lease is already expired,
+    and they stay `RUNNING` with `attempt` `0`. It then replaces
+    `tasks_running_has_owner_check` with one check of the same name:
+    `RUNNING` requires `worker_id`, `claimed_at`, and `lease_expires_at`.
+    It adds the partial index `idx_tasks_running_lease` on
+    `lease_expires_at` for running rows. No query uses that index yet;
+    it is for the M4 reaper. Apply V5 with the application stopped.
+    Running workers from before V5 do not set a lease on claim, so the
+    new check would reject their claims.
 
 The datasource is read from `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`.
 The defaults match the Compose database, so the application runs without
@@ -464,8 +582,8 @@ Testcontainers) but does not need the Compose database.
 `spring-boot:run` starts the worker pool. `POST /api/v1/tasks` with
 `taskType` `ECHO`, `FAIL`, `SLEEP`, or `NOOP` is claimed by that pool.
 A database error backs off (`engine.worker.error-backoff`) and the loop
-keeps running. A crash after claim leaves the task `RUNNING`; the pool
-does not pick that row up again.
+keeps running. A crash after claim leaves the task `RUNNING` with a
+lease that expires; the pool does not pick that row up again.
 
 ### Demo
 
@@ -508,10 +626,13 @@ FOR UPDATE SKIP LOCKED
 The claim operation then changes the selected task to:
 
 ``` text
-status     = RUNNING
-claimed_at = current timestamp
-updated_at = current timestamp (same now() as claimed_at)
-worker_id  = claiming worker
+status            = RUNNING
+claimed_at        = current timestamp
+updated_at        = current timestamp (same now() as claimed_at)
+worker_id         = claiming worker
+lease_expires_at  = now() + engine.lease.duration
+attempt           = attempt + 1
+last_heartbeat_at = NULL
 ```
 
 The update also requires the row to still be `PENDING`. A null
@@ -556,18 +677,44 @@ This allows multiple workers to make progress concurrently.
     context starts and the migrations apply to a fresh database.
 -   `V4MigrationTest` migrates a second database only as far as V3, inserts
     a pending row that still has `claimed_at`, a running row with an owner,
-    and a completed row with no `finished_at`, then migrates to V4 and
-    checks the backfill and the constraint names.
+    and a completed row with no `finished_at`, then migrates to V4 (and
+    stops there) and checks the backfill and the constraint names.
+-   `V5MigrationTest` migrates its own database to V4, inserts a pending
+    row, a running row with an owner and a past `claimed_at`, and a
+    completed row, then migrates to V5. Every row has `attempt` `0`. The
+    running row's lease equals its `claimed_at`, and no row has a
+    heartbeat. The check names are unchanged, the one
+    `tasks_running_has_owner_check` names `worker_id`, `claimed_at`, and
+    `lease_expires_at`, `idx_tasks_running_lease` exists, and a
+    `RUNNING` insert with no lease fails with SQLState `23514`.
 -   `ClaimUpdatedAtTest` backdates `updated_at`, claims the task, and
     checks that `updated_at` moved to the same instant as `claimed_at`.
-    It also checks that a null worker id is rejected and the row stays
-    `PENDING`.
+    Two claimed tasks each go from `attempt` `0` to `1`, have no
+    heartbeat, and have `lease_expires_at = claimed_at + duration` in
+    SQL. It also checks that a null worker id is rejected and the row
+    stays `PENDING`.
+-   `LeasePropertiesTest` checks the 30s and 10s defaults, rejects null,
+    zero, negative, and sub-microsecond values and an interval that is
+    not shorter than the duration, accepts an interval longer than a
+    third of the lease, and truncates `leaseMicros` to whole
+    microseconds.
 -   `GuardedTransitionTest` tries complete, fail, and cancel from every
     status. An applied write moves `updated_at` and `finished_at`. A
     rejected write leaves the row unchanged. A second complete with a
     different result is already applied. The documented requeue, pinned
-    to the observed worker, lets a new worker finish and rejects the old
-    one.
+    to the observed worker, lets a new worker finish with its own
+    attempt and rejects the old one.
+-   `LeaseExtensionTest` extends a lease and checks
+    `lease_expires_at = last_heartbeat_at + duration`, including a
+    sub-second duration, with `updated_at` and `attempt` unchanged. A
+    wrong id, worker, or attempt, a `PENDING` row, and a terminal row
+    return `false` and change nothing. A lease already in the past still
+    extends. The same worker with another attempt cannot extend,
+    complete, or fail a row that is still `RUNNING`, and after a real
+    complete or fail that call is rejected, not already applied. Test
+    SQL requeues a task and the same worker claims it again: the attempt
+    goes up, the old attempt is rejected, and the new one completes.
+    Only claim changes `attempt`.
 -   `TransitionLockHoldTest` holds an uncommitted claim. Cancel waits
     (`pg_blocking_pids`), then is rejected if that claim commits and
     applies if it rolls back. A second claim returns nothing while the
@@ -579,6 +726,26 @@ This allows multiple workers to make progress concurrently.
     handler runs with no transaction and no borrowed connection, an
     interrupt during `SLEEP` leaves the task `RUNNING`, and a returned
     outcome is still written once if the thread is interrupted afterward.
+-   `LeaseHeartbeatTest` runs the heartbeat and the executor on a
+    scheduler that fires only when the test says so, with no database.
+    The first delay and the period are the interval, and nothing runs
+    until a fire. One fire is one extend for that worker and attempt.
+    `false` sets `leaseLost()` and cancels the tick. A data-access error
+    or another exception is not lease loss, and the next fire extends
+    again. An `Error` propagates. A watch closed before or during the
+    extend does not set `leaseLost()`. An interrupt, an `Error`, or an
+    exception from the handler cancels the tick before any finish. A
+    returned outcome is finished once even after lease loss. A missing
+    handler starts no tick. A stopped heartbeat hands out a closed watch,
+    and its phase is below `WorkerPool`'s.
+-   `LeaseHeartbeatIntegrationTest` uses its own context with a 1s lease
+    and a 300ms heartbeat. A blocked handler stays `RUNNING` for three
+    lease durations, measured with `clock_timestamp()`, while the lease
+    moves forward, then completes once. With a real `LeaseHeartbeat` on a
+    scheduler that never fires, the lease expires and the task is still
+    `RUNNING` with the same worker. When test SQL bumps `attempt` under
+    a blocked handler, the handler sees `leaseLost()`, returns success
+    anyway, and its complete changes nothing.
 -   `WorkerPoolTest` builds its own pool and stops it afterwards. The
     shared application pool stays off. Four loops drain fifty tasks with
     one handler call each. In-flight handlers stay within `concurrency`.
@@ -599,13 +766,23 @@ This allows multiple workers to make progress concurrently.
 -   `IdleBackoffTest` checks that the idle delay doubles until
     `max-idle-interval` and that equal jitter stays inside half of the
     current delay through the whole delay.
+-   `TaskApiTest` runs the HTTP API against the database. A new task
+    shows `attempt` `0` and a null `leaseExpiresAt`. After a claim, `GET`
+    shows `attempt` `1` and the stored lease. Cancel of a `RUNNING` task
+    is `409` and leaves the attempt, the lease, and the heartbeat as
+    they were. `workerId` appears once and `lastHeartbeatAt` does not
+    appear. `TaskControllerTest` checks the same fields and the status
+    codes without a database.
 
 All of the Spring tests extend `PostgresIntegrationTest`, which uses one
 shared Testcontainers PostgreSQL container, deletes every task before
 each test, and leaves workers disabled. The container turns `fsync` off
 and sets short lock timeouts so the suite does not hang. That container
-is not evidence that a crash is durable. `V4MigrationTest` uses the same
-server and its own database, so it does not start the Spring context.
+is not evidence that a crash is durable. `V4MigrationTest` and
+`V5MigrationTest` use the same server and their own databases, so they
+do not start the Spring context. `LeaseHeartbeatIntegrationTest` starts
+its own Spring context so its short lease does not reach the other
+tests.
 
 ## Verified So Far
 
@@ -639,23 +816,39 @@ The current implementation has successfully demonstrated:
     required
 -   a bounded worker pool claims, runs, and finishes tasks, and shutdown
     does not claim new work (`WorkerPoolTest`)
+-   V5 applies to a V4 database with a running row
+    (`V5MigrationTest`)
+-   claim sets a lease and increments `attempt`; only claim changes
+    `attempt` (`ClaimUpdatedAtTest`, `LeaseExtensionTest`)
+-   lease extension, complete, and fail require the worker and the
+    attempt, including the same worker with a different attempt
+    (`LeaseExtensionTest`)
+-   heartbeats keep a task `RUNNING` for three lease durations, and a
+    task with no heartbeats keeps an expired lease and stays `RUNNING`
+    (`LeaseHeartbeatIntegrationTest`)
+-   `GET` shows `attempt` and `leaseExpiresAt` (`TaskApiTest`)
 
 Example successful state transition:
 
 ``` text
 Before:
 
-status     = PENDING
-claimed_at = NULL
-worker_id  = NULL
+status            = PENDING
+claimed_at        = NULL
+worker_id         = NULL
+attempt           = 0
+lease_expires_at  = NULL
 
 
 After:
 
-status     = RUNNING
-claimed_at = <timestamp>
-updated_at = <same timestamp>
-worker_id  = <worker UUID>
+status            = RUNNING
+claimed_at        = <timestamp>
+updated_at        = <same timestamp>
+worker_id         = <worker UUID>
+attempt           = 1
+lease_expires_at  = <same timestamp> + engine.lease.duration
+last_heartbeat_at = NULL
 ```
 
 ## Current Milestone
@@ -692,14 +885,23 @@ finish write. M1.4 added `WorkerPool`. M1.5 added `/api/v1/tasks`
 (create, get, cancel). M1.6 is this documentation and the curl demo.
 Complete and fail stay on the worker. They are not HTTP operations.
 
-The next milestone is M3, leases and heartbeats. Crash recovery is M4.
-Neither is part of M1.
+**M3 --- leases and heartbeats** is complete (M3.1 through M3.5). M3.1
+added `V5` and the claim lease. M3.2 added `extendLease` and the
+`attempt` guard on complete and fail. M3.3 added `attempt` and
+`leaseExpiresAt` to `TaskResponse`. M3.4 added `LeaseHeartbeat` and
+`TaskContext.leaseLost()`. M3.5 is this documentation. The decisions
+and the deviations from the original roadmap text are in ADR 0003, ADR
+0004, and the M3 deviations table in the roadmap.
+
+The next milestone is M4, crash recovery and the fencing proof: a
+reaper that returns expired leases to `PENDING`, and the crash and
+zombie tests. It has not started.
 
 ## Planned Development Order
 
 The project should progress roughly in this order. Phase headings
 below are a learning outline. Milestone ids live in `PROJECT_ROADMAP.md`.
-The next milestone is M3. M4 is the following one, not part of M3.
+The next milestone is M4.
 
 ### Phase 1 --- Task claiming
 
@@ -730,13 +932,13 @@ The next milestone is M3. M4 is the following one, not part of M3.
 These checkboxes are two milestones. Do not treat the phase as one
 implementation. The ids are in `PROJECT_ROADMAP.md`.
 
-M3, leases and heartbeats (next; not started):
+M3, leases and heartbeats (complete):
 
--   [ ] Task lease expiration
--   [ ] Heartbeats
--   [ ] `attempt` incremented on claim and checked on worker writes
+-   [x] Task lease expiration
+-   [x] Heartbeats
+-   [x] `attempt` incremented on claim and checked on worker writes
 
-M4, crash recovery and the fencing proof (after M3):
+M4, crash recovery and the fencing proof (next; not started):
 
 -   [ ] Worker crash simulation
 -   [ ] Recovery of abandoned tasks
@@ -860,11 +1062,11 @@ Key design decisions are recorded in `docs/adr/`:
 -   [0003 --- Fencing via the attempt counter](docs/adr/0003-fencing-via-attempt.md)
 -   [0004 --- Task lifecycle and execution model](docs/adr/0004-task-lifecycle-and-execution-model.md)
 
-ADRs 0002 and 0003 are accepted targets. Their "Current implementation
-versus planned" notes say what the code does today: finish writes exist,
-and at-least-once recovery and the `attempt` fence do not. ADR 0004's
-current-implementation section matches the code, including
-`/api/v1/tasks`.
+ADRs 0002 and 0003 are accepted. Their "Current implementation versus
+planned" notes say what the code does today: leases, heartbeats, and the
+`attempt` guard exist; at-least-once recovery and the zombie proof do
+not (M4). ADR 0004's current-implementation section matches the code,
+including `/api/v1/tasks` and the M3 lease and heartbeat behavior.
 
 ## Repository Structure
 
@@ -901,7 +1103,7 @@ created all at once.
 
 ## Current Status
 
-**Milestone: M0 complete. M1 complete, including former M2 and the idle-backoff and worker-pool health work. Next milestone: M3 (leases and heartbeats). M4 (crash recovery) comes after M3.**
+**Milestone: M0 complete. M1 complete, including former M2 and the idle-backoff and worker-pool health work. M3 (leases and heartbeats) complete. Next milestone: M4 (crash recovery and the fencing proof).**
 
 The system can currently create a task, store it in PostgreSQL, safely
 claim a pending task using PostgreSQL row locking, and complete, fail, or
@@ -911,13 +1113,18 @@ held, and writes the outcome once. `WorkerPool` does that on a fixed
 number of platform threads and, on shutdown, stops claiming, finishes
 work already claimed, and interrupts a handler that is still running
 when `engine.worker.shutdown-timeout` ends. The `WHERE` clause of each
-update is the lifecycle rule. Concurrent claiming, the cancel-versus-claim
-race, the executor, and the pool are covered by integration tests that
-run against Testcontainers. GitHub Actions runs `./mvnw verify`.
+update is the lifecycle rule. Each claim is a lease with an `attempt`.
+While a handler runs, heartbeats extend that lease for its worker and
+attempt, and a rejected extension sets `TaskContext.leaseLost()`.
+Complete and fail apply only for that worker and attempt. Concurrent
+claiming, the cancel-versus-claim race, the executor, the pool, leases,
+and heartbeats are covered by integration tests that run against
+Testcontainers. GitHub Actions runs `./mvnw verify`.
 
-Not built yet: attempts, leases, heartbeats, recovery of abandoned
-tasks, fencing, retries, and idempotency. A crash after claim, an
+Not built yet: recovery of abandoned tasks (a reaper), the crash and
+zombie proofs, retries, and idempotency. A crash after claim, an
 interrupt during the handler, or a finish write that throws leaves the
-task `RUNNING`. The guarantees section and ADR 0004 are the limit of
-what M1 claims. Clients create a task with `curl` and read it until the
-status is terminal.
+task `RUNNING`, and its expired lease is not acted on. The guarantees
+section and ADRs 0003 and 0004 are the limit of what M1 and M3 claim.
+Clients create a task with `curl` and read it until the status is
+terminal.
