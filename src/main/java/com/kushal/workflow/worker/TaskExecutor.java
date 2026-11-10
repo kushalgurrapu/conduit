@@ -22,6 +22,12 @@ import java.util.UUID;
  * The handler runs only after claim has committed, so it does not hold a
  * pooled connection. A finish write that throws is logged and not retried;
  * the row stays {@code RUNNING}.
+ *
+ * <p>While the handler runs, {@link LeaseHeartbeat} extends the lease from
+ * its own thread and connection. The watch is closed on every exit from
+ * the handler, including an interrupt and an {@link Error}, before any
+ * finish write. A returned outcome is finished even when the lease was
+ * lost; the attempt guard decides whether that write lands.
  */
 @Component
 public class TaskExecutor {
@@ -34,6 +40,7 @@ public class TaskExecutor {
     private final TaskService taskService;
     private final Map<String, TaskHandler> taskHandlers;
     private final JsonMapper jsonMapper;
+    private final LeaseHeartbeat heartbeat;
 
     /**
      * Runs after a claim has committed and before the handler. Empty in
@@ -45,10 +52,12 @@ public class TaskExecutor {
     public TaskExecutor(
             TaskService taskService,
             @Qualifier("taskHandlers") Map<String, TaskHandler> taskHandlers,
-            JsonMapper jsonMapper) {
+            JsonMapper jsonMapper,
+            LeaseHeartbeat heartbeat) {
         this.taskService = taskService;
         this.taskHandlers = requireTypeKeys(taskHandlers);
         this.jsonMapper = jsonMapper;
+        this.heartbeat = heartbeat;
     }
 
     /**
@@ -99,12 +108,7 @@ public class TaskExecutor {
 
         TaskOutcome outcome;
         try {
-            TaskContext context = new TaskContext(
-                    claimed.id(),
-                    claimed.taskType(),
-                    jsonMapper.readTree(claimed.payload()),
-                    workerId);
-            outcome = handler.execute(context);
+            outcome = executeWatched(handler, claimed, workerId);
         } catch (Exception ex) {
             // An interrupt is not a failed task. The flag is restored so
             // the caller can leave the loop without claiming again.
@@ -122,6 +126,25 @@ public class TaskExecutor {
             outcome = new TaskOutcome.Failed("handler returned null");
         }
         finish(claimed, workerId, outcome);
+    }
+
+    /**
+     * The watch is closed in {@code finally} so every exit, including an
+     * {@link Error}, stops the heartbeat before the caller writes a finish.
+     */
+    private TaskOutcome executeWatched(TaskHandler handler, Task claimed, UUID workerId) throws Exception {
+        TaskContext context = new TaskContext(
+                claimed.id(),
+                claimed.taskType(),
+                jsonMapper.readTree(claimed.payload()),
+                workerId,
+                claimed.attempt());
+        LeaseHeartbeat.Watch watch = heartbeat.start(context);
+        try {
+            return handler.execute(context);
+        } finally {
+            watch.close();
+        }
     }
 
     /**

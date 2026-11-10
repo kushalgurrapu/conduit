@@ -581,7 +581,7 @@ class WorkerPoolTest extends PostgresIntegrationTest {
         private final int failures;
 
         private FlakyExecutor(int failures) {
-            super(null, Map.of(), null);
+            super(null, Map.of(), null, null);
             this.failures = failures;
         }
 
@@ -606,7 +606,7 @@ class WorkerPoolTest extends PostgresIntegrationTest {
         private final AtomicInteger calls = new AtomicInteger();
 
         private ScriptedExecutor(boolean... results) {
-            super(null, Map.of(), null);
+            super(null, Map.of(), null, null);
             this.results = results;
         }
 
@@ -624,7 +624,7 @@ class WorkerPoolTest extends PostgresIntegrationTest {
     static final class IdleExecutor extends TaskExecutor {
 
         private IdleExecutor() {
-            super(null, Map.of(), null);
+            super(null, Map.of(), null, null);
         }
 
         @Override
@@ -637,7 +637,7 @@ class WorkerPoolTest extends PostgresIntegrationTest {
     static final class BrokenExecutor extends TaskExecutor {
 
         private BrokenExecutor() {
-            super(null, Map.of(), null);
+            super(null, Map.of(), null, null);
         }
 
         @Override

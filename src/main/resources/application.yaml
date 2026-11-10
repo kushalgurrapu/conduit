@@ -12,8 +12,8 @@ spring:
     password: ${DB_PASSWORD:workflow}
     hikari:
       # Handlers do not hold a connection. Size the pool for claims,
-      # finishes, and the API together:
-      # maximum-pool-size >= engine.worker.concurrency + API headroom.
+      # finishes, the API, and the one lease-heartbeat thread together:
+      # maximum-pool-size >= engine.worker.concurrency + API headroom + 1.
       # Nothing checks this at startup.
       maximum-pool-size: 10
   flyway:

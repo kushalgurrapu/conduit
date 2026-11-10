@@ -17,6 +17,14 @@ public interface TaskHandler {
      * Runs outside any transaction. A thrown {@link InterruptedException}
      * means the task stays {@code RUNNING}. Any other {@link Exception}
      * is recorded as {@code FAILED}. An {@link Error} is not caught.
+     *
+     * <p>{@link TaskContext#leaseLost()} becomes {@code true} when a
+     * heartbeat could not extend this attempt's lease. A handler that
+     * honors it returns a {@link TaskOutcome} and leaves the interrupt flag
+     * clear; the finish write is still made and is rejected if the attempt
+     * no longer matches. Throwing {@link InterruptedException} is the
+     * shutdown path and skips the finish write. The built-in handlers do
+     * not poll the flag, and {@code SLEEP} still wakes only on an interrupt.
      */
     TaskOutcome execute(TaskContext ctx) throws Exception;
 }
