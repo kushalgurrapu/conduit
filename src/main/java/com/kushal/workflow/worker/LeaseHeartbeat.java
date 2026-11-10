@@ -25,7 +25,8 @@ import java.util.concurrent.TimeUnit;
  *
  * <ul>
  *   <li>{@code false} while the watch is open marks the context's lease
- *       lost. The handler decides whether to stop.</li>
+ *       lost and closes the watch so later ticks do not run. The handler
+ *       decides whether to stop.</li>
  *   <li>A thrown {@link Exception} is logged. The next tick tries again;
  *       there is no retry inside a tick, and an error is not lease loss.</li>
  *   <li>An {@link Error} is logged and rethrown. The executor does not
@@ -120,8 +121,9 @@ public class LeaseHeartbeat implements SmartLifecycle {
                     context.taskId(), context.attempt(), error);
             throw error;
         }
-        if (!extended && watch.isOpen() && !context.leaseLost()) {
+        if (!extended && watch.isOpen()) {
             context.markLeaseLost();
+            watch.close();
             log.warn("Lease for task {} attempt {} was not extended; the handler is asked to stop",
                     context.taskId(), context.attempt());
         }

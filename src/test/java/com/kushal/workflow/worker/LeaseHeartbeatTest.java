@@ -86,6 +86,22 @@ class LeaseHeartbeatTest {
     }
 
     @Test
+    void closeWatchWhenLeaseLost() {
+        TaskContext context = context(1);
+        heartbeat.start(context);
+        taskService.script(() -> false);
+
+        ManualScheduler.Tick tick = scheduler.onlyTick();
+        tick.fire();
+        tick.fire();
+
+        assertEquals(1, taskService.extendCalls.size());
+        assertTrue(context.leaseLost());
+        assertTrue(tick.isCancelled());
+        assertEquals(Boolean.FALSE, tick.mayInterruptIfRunning());
+    }
+
+    @Test
     void dataAccessErrorIsNotLeaseLossAndTheNextFireStillExtends() {
         TaskContext context = context(1);
         heartbeat.start(context);
