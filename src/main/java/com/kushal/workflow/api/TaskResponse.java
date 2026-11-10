@@ -24,7 +24,9 @@ public record TaskResponse(
         Instant updatedAt,
         Instant claimedAt,
         Instant finishedAt,
-        UUID workerId
+        UUID workerId,
+        int attempt,
+        Instant leaseExpiresAt
 ) {
 
     static TaskResponse from(Task task, JsonMapper jsonMapper) {
@@ -39,7 +41,9 @@ public record TaskResponse(
                 task.updatedAt(),
                 task.claimedAt(),
                 task.finishedAt(),
-                task.workerId());
+                task.workerId(),
+                task.attempt(),
+                task.leaseExpiresAt());
     }
 
     /**

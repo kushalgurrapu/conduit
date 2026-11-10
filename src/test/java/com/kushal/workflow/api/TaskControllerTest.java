@@ -43,6 +43,8 @@ class TaskControllerTest {
     private static final Instant CREATED = Instant.parse("2026-10-06T12:00:00Z");
     private static final Instant UPDATED = Instant.parse("2026-10-06T12:00:01Z");
     private static final Instant FINISHED = Instant.parse("2026-10-06T12:00:02Z");
+    private static final Instant HEARTBEAT = Instant.parse("2026-10-06T12:00:03Z");
+    private static final Instant LEASE_EXPIRES = Instant.parse("2026-10-06T12:00:33.123456Z");
 
     @Autowired
     private MockMvc mockMvc;
@@ -68,7 +70,9 @@ class TaskControllerTest {
                 .andExpect(jsonPath("$.payload.message").value("hi"))
                 .andExpect(jsonPath("$.result").value(nullValue()))
                 .andExpect(jsonPath("$.claimedAt").value(nullValue()))
-                .andExpect(jsonPath("$.workerId").value(nullValue()));
+                .andExpect(jsonPath("$.workerId").value(nullValue()))
+                .andExpect(jsonPath("$.attempt").value(0))
+                .andExpect(jsonPath("$.leaseExpiresAt").value(nullValue()));
     }
 
     @Test
@@ -154,6 +158,24 @@ class TaskControllerTest {
     }
 
     @Test
+    void getShowsTheAttemptAndLeaseButNotTheHeartbeat() throws Exception {
+        UUID id = UUID.fromString("00000000-0000-0000-0000-0000000000cb");
+        UUID workerId = UUID.fromString("00000000-0000-0000-0000-0000000000d1");
+        when(taskService.getTask(id)).thenReturn(new Task(
+                id, "ECHO", TaskStatus.RUNNING, "{\"message\":\"hi\"}", null, null,
+                CREATED, UPDATED, UPDATED, null, workerId,
+                2, LEASE_EXPIRES, HEARTBEAT));
+
+        mockMvc.perform(get("/api/v1/tasks/{id}", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("RUNNING"))
+                .andExpect(jsonPath("$.workerId").value(workerId.toString()))
+                .andExpect(jsonPath("$.attempt").value(2))
+                .andExpect(jsonPath("$.leaseExpiresAt").value(LEASE_EXPIRES.toString()))
+                .andExpect(jsonPath("$.lastHeartbeatAt").doesNotExist());
+    }
+
+    @Test
     void badTaskIdIsProblemDetail() throws Exception {
         mockMvc.perform(get("/api/v1/tasks/not-a-uuid"))
                 .andExpect(status().isBadRequest())
@@ -170,7 +192,9 @@ class TaskControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"))
                 .andExpect(jsonPath("$.finishedAt").value(FINISHED.toString()))
-                .andExpect(jsonPath("$.workerId").value(nullValue()));
+                .andExpect(jsonPath("$.workerId").value(nullValue()))
+                .andExpect(jsonPath("$.attempt").value(0))
+                .andExpect(jsonPath("$.leaseExpiresAt").value(nullValue()));
 
         UUID againId = UUID.fromString("00000000-0000-0000-0000-0000000000c6");
         Task already = task(againId, "ECHO", TaskStatus.CANCELLED, "{}", null, null, null, FINISHED, null);
