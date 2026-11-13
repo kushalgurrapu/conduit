@@ -403,7 +403,7 @@ class RecoveryIntegrationTest extends RecoveryContextTest {
 
         assertEquals(Boolean.FALSE, a.leaseLostAtReturn.get());
         assertCompleted(id, workerA, 1);
-        assertTrue(leaseExpired(id));
+        awaitLeaseExpired(id);
         assertEquals(List.of(new History(1, workerA, AttemptOutcome.COMPLETED)), history(id));
         Snapshot before = snapshot(id);
 
@@ -430,7 +430,7 @@ class RecoveryIntegrationTest extends RecoveryContextTest {
     private void reapExpired(UUID id) throws InterruptedException {
         awaitLeaseExpired(id);
 
-        assertEquals(1, reaper.reapOnce());
+        assertEquals(1, reapAfterExpiry());
 
         Task pending = assertRow(id, TaskStatus.PENDING, 1, null);
         assertNull(pending.claimedAt());
@@ -521,6 +521,17 @@ class RecoveryIntegrationTest extends RecoveryContextTest {
             }
             Thread.sleep(50);
         }
+    }
+
+    /** Retries a zero: the reap reads {@code NOW()} in a later transaction, and the database clock can step backwards. */
+    private int reapAfterExpiry() throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(WAIT_SECONDS);
+        int reaped = reaper.reapOnce();
+        while (reaped == 0 && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+            reaped = reaper.reapOnce();
+        }
+        return reaped;
     }
 
     private boolean leaseExpired(UUID id) {
