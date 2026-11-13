@@ -167,6 +167,16 @@ public class LeaseHeartbeat implements SmartLifecycle {
     }
 
     /**
+     * Not stopped on a context pause: {@code stop()} is permanent, so a resumed
+     * context would run handlers without heartbeats, and an idle daemon thread
+     * costs nothing.
+     */
+    @Override
+    public boolean isPauseable() {
+        return false;
+    }
+
+    /**
      * One task's scheduled tick. Closing it is idempotent.
      */
     public static final class Watch {

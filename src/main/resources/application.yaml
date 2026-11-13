@@ -12,8 +12,10 @@ spring:
     password: ${DB_PASSWORD:workflow}
     hikari:
       # Handlers do not hold a connection. Size the pool for claims,
-      # finishes, the API, and the one lease-heartbeat thread together:
-      # maximum-pool-size >= engine.worker.concurrency + API headroom + 1.
+      # finishes, the API, the one lease-heartbeat thread, and the one
+      # lease-reaper thread together:
+      # maximum-pool-size >= engine.worker.concurrency + API headroom
+      #                      + 1 (heartbeat) + 1 (reaper).
       # Nothing checks this at startup.
       maximum-pool-size: 10
   flyway:
@@ -40,6 +42,17 @@ engine:
     # shorter than the duration. An interval longer than one third still starts.
     duration: 30s
     heartbeat-interval: 10s
+  reaper:
+    # Safe in every process, including API-only ones: concurrent reapers
+    # take disjoint rows. Independent of engine.worker.enabled. With these
+    # defaults, recovery after a lease stops moving takes roughly
+    # lease.duration + interval + worker.max-idle-interval (about 70s).
+    # That is an estimate, not a bound: earlier batches, short batches,
+    # pool waits, and a PENDING backlog all add to it.
+    # interval must be at least 100ms; batch-size is 1 to 1000.
+    enabled: true
+    interval: 10s
+    batch-size: 100
 
 management:
   endpoint:

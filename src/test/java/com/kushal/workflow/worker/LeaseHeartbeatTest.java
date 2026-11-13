@@ -205,6 +205,11 @@ class LeaseHeartbeatTest {
     }
 
     @Test
+    void heartbeatIsNotPauseable() {
+        assertFalse(heartbeat.isPauseable());
+    }
+
+    @Test
     void executorContextCarriesTheClaimedAttempt() {
         AtomicReference<TaskContext> seen = new AtomicReference<>();
         TaskExecutor executor = executor(new ScriptedHandler("WORK", ctx -> {

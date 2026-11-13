@@ -15,7 +15,7 @@ import java.util.regex.Pattern;
  * type: the map is the index, and building it is what fails startup.
  */
 @Configuration
-@EnableConfigurationProperties({WorkerProperties.class, LeaseProperties.class})
+@EnableConfigurationProperties({WorkerProperties.class, LeaseProperties.class, ReaperProperties.class})
 public class HandlerConfiguration {
 
     /**
