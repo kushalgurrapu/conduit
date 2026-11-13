@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.net.URI;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -44,6 +45,18 @@ public class TaskController {
     @GetMapping("/{id}")
     public TaskResponse get(@PathVariable UUID id) {
         return TaskResponse.from(taskService.getTask(id), jsonMapper);
+    }
+
+    /**
+     * {@code 200} with the attempts ordered by attempt, or none when the
+     * task was never claimed. {@code 404} when the id is missing.
+     */
+    @GetMapping("/{id}/attempts")
+    public TaskAttemptsResponse attempts(@PathVariable UUID id) {
+        List<TaskAttemptResponse> attempts = taskService.getAttempts(id).stream()
+                .map(TaskAttemptResponse::from)
+                .toList();
+        return new TaskAttemptsResponse(id, attempts);
     }
 
     /**

@@ -1,7 +1,9 @@
 package com.kushal.workflow.api;
 
+import com.kushal.workflow.task.AttemptOutcome;
 import com.kushal.workflow.task.CancelResult;
 import com.kushal.workflow.task.Task;
+import com.kushal.workflow.task.TaskAttempt;
 import com.kushal.workflow.task.TaskNotFoundException;
 import com.kushal.workflow.task.TaskService;
 import com.kushal.workflow.task.TaskStatus;
@@ -14,11 +16,14 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
@@ -35,7 +40,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * HTTP status and {@code ProblemDetail} shape. The service is a mock, so
  * these tests do not open a database. The real create/get/cancel path is
- * {@link TaskApiTest}.
+ * {@link TaskApiTest}, and the real attempts path is {@link TaskAttemptsApiTest}.
  */
 @WebMvcTest(controllers = TaskController.class)
 class TaskControllerTest {
@@ -173,6 +178,91 @@ class TaskControllerTest {
                 .andExpect(jsonPath("$.attempt").value(2))
                 .andExpect(jsonPath("$.leaseExpiresAt").value(LEASE_EXPIRES.toString()))
                 .andExpect(jsonPath("$.lastHeartbeatAt").doesNotExist());
+    }
+
+    @Test
+    void attemptsReturnsEveryFieldInAttemptOrderIncludingAnOpenAttempt() throws Exception {
+        UUID id = UUID.fromString("00000000-0000-0000-0000-0000000000e1");
+        UUID workerA = UUID.fromString("00000000-0000-0000-0000-0000000000d2");
+        UUID workerB = UUID.fromString("00000000-0000-0000-0000-0000000000d3");
+        when(taskService.getAttempts(id)).thenReturn(List.of(
+                new TaskAttempt(id, 1, workerA, CREATED, UPDATED, AttemptOutcome.LEASE_EXPIRED, null),
+                new TaskAttempt(id, 2, workerB, FINISHED, null, null, null)));
+
+        mockMvc.perform(get("/api/v1/tasks/{id}/attempts", id))
+                .andExpect(status().isOk())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(jsonPath("$.taskId").value(id.toString()))
+                .andExpect(jsonPath("$.attempts", hasSize(2)))
+                .andExpect(jsonPath("$.attempts[0].attempt").value(1))
+                .andExpect(jsonPath("$.attempts[0].workerId").value(workerA.toString()))
+                .andExpect(jsonPath("$.attempts[0].startedAt").value(CREATED.toString()))
+                .andExpect(jsonPath("$.attempts[0].endedAt").value(UPDATED.toString()))
+                .andExpect(jsonPath("$.attempts[0].outcome").value("LEASE_EXPIRED"))
+                .andExpect(jsonPath("$.attempts[0].error").value(nullValue()))
+                .andExpect(jsonPath("$.attempts[0].taskId").doesNotExist())
+                .andExpect(jsonPath("$.attempts[1].attempt").value(2))
+                .andExpect(jsonPath("$.attempts[1].workerId").value(workerB.toString()))
+                .andExpect(jsonPath("$.attempts[1].startedAt").value(FINISHED.toString()))
+                .andExpect(jsonPath("$.attempts[1].endedAt").value(nullValue()))
+                .andExpect(jsonPath("$.attempts[1].outcome").value(nullValue()))
+                .andExpect(jsonPath("$.attempts[1].error").value(nullValue()));
+    }
+
+    @Test
+    void attemptsShowTheErrorOfAFailedAttempt() throws Exception {
+        UUID id = UUID.fromString("00000000-0000-0000-0000-0000000000e2");
+        UUID workerId = UUID.fromString("00000000-0000-0000-0000-0000000000d4");
+        when(taskService.getAttempts(id)).thenReturn(List.of(
+                new TaskAttempt(id, 1, workerId, CREATED, FINISHED, AttemptOutcome.FAILED, "boom")));
+
+        mockMvc.perform(get("/api/v1/tasks/{id}/attempts", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.attempts", hasSize(1)))
+                .andExpect(jsonPath("$.attempts[0].endedAt").value(FINISHED.toString()))
+                .andExpect(jsonPath("$.attempts[0].outcome").value("FAILED"))
+                .andExpect(jsonPath("$.attempts[0].error").value("boom"));
+    }
+
+    @Test
+    void attemptsOfAnUnclaimedTaskAreEmptyAndAMissingTaskIsNotFound() throws Exception {
+        UUID id = UUID.fromString("00000000-0000-0000-0000-0000000000e3");
+        when(taskService.getAttempts(id)).thenReturn(List.of());
+
+        mockMvc.perform(get("/api/v1/tasks/{id}/attempts", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.taskId").value(id.toString()))
+                .andExpect(jsonPath("$.attempts", hasSize(0)));
+
+        UUID missing = UUID.fromString("00000000-0000-0000-0000-0000000000e4");
+        when(taskService.getAttempts(missing)).thenThrow(new TaskNotFoundException(missing));
+
+        mockMvc.perform(get("/api/v1/tasks/{id}/attempts", missing))
+                .andExpect(status().isNotFound())
+                .andExpect(problemDetail(404))
+                .andExpect(jsonPath("$.detail").value(containsString(missing.toString())));
+    }
+
+    @Test
+    void attemptsWithABadTaskIdIsProblemDetail() throws Exception {
+        mockMvc.perform(get("/api/v1/tasks/not-a-uuid/attempts"))
+                .andExpect(status().isBadRequest())
+                .andExpect(problemDetail(400));
+
+        verify(taskService, never()).getAttempts(any());
+    }
+
+    @Test
+    void attemptsDatabaseErrorIsGenericProblemDetail() throws Exception {
+        UUID id = UUID.fromString("00000000-0000-0000-0000-0000000000e5");
+        when(taskService.getAttempts(id)).thenThrow(
+                new DataRetrievalFailureException("select secret_column from task_attempts"));
+
+        mockMvc.perform(get("/api/v1/tasks/{id}/attempts", id))
+                .andExpect(status().isInternalServerError())
+                .andExpect(problemDetail(500))
+                .andExpect(jsonPath("$.detail").value("The request could not be completed"))
+                .andExpect(content().string(not(containsString("secret_column"))));
     }
 
     @Test
