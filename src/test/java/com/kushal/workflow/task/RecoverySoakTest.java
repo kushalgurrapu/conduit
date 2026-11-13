@@ -166,6 +166,7 @@ class RecoverySoakTest extends PostgresIntegrationTest {
         private final Map<Counter, Integer> counters = new EnumMap<>(Counter.class);
         private final List<String> trace = new ArrayList<>();
         private int step;
+        private int expiries;
         private boolean draining;
 
         private Walk(long seed, int tasks, int workers) {
@@ -418,10 +419,13 @@ class RecoverySoakTest extends PostgresIntegrationTest {
         }
 
         private void expire(int task) {
+            // The time is fixed and in the past, so a backward step of the database clock cannot un-expire the row.
             int updated = jdbcClient.sql("""
-                            UPDATE tasks SET lease_expires_at = NOW() - INTERVAL '1 microsecond'
+                            UPDATE tasks
+                            SET lease_expires_at = TIMESTAMPTZ '2000-01-01 00:00:00+00' + :n * INTERVAL '1 microsecond'
                             WHERE id = :id AND status = 'RUNNING'
                             """)
+                    .param("n", ++expiries)
                     .param("id", taskIds.get(task))
                     .update();
             assertEquals(1, updated);
@@ -452,13 +456,36 @@ class RecoverySoakTest extends PostgresIntegrationTest {
                 }
             }
             assertEquals(batch.size(), reapedTasks.size(), "a task was reaped twice in one batch");
-            assertTrue(expected.containsAll(reapedTasks), "reaped " + reapedTasks + ", expected within " + expected);
+            assertTrue(expected.containsAll(reapedTasks),
+                    () -> "reaped " + reapedTasks + ", expected within " + expected + expiredRows(expected));
             if (batchSize >= expected.size()) {
-                assertEquals(expected, reapedTasks, "a batch of " + batchSize + " reaped");
+                assertEquals(expected, reapedTasks,
+                        () -> "a batch of " + batchSize + " reaped" + expiredRows(expected));
             }
             expectedExpired.removeAll(reapedTasks);
             record(Action.REAP, -1, -1, "BATCH " + batchSize + " REAPED " + reapedTasks);
             return batch;
+        }
+
+        /** One line per task, in index order, with its row as it is now and the database's {@code NOW()}. */
+        private String expiredRows(Set<Integer> indexes) {
+            StringBuilder out = new StringBuilder();
+            for (int index : new TreeSet<>(indexes)) {
+                out.append('\n').append(jdbcClient.sql("""
+                                SELECT status, worker_id, attempt, lease_expires_at, NOW() AS now
+                                FROM tasks
+                                WHERE id = :id
+                                """)
+                        .param("id", taskIds.get(index))
+                        .query((rs, rowNum) -> "  task " + index
+                                + " status=" + rs.getString("status")
+                                + " worker_id=" + rs.getObject("worker_id", UUID.class)
+                                + " attempt=" + rs.getInt("attempt")
+                                + " lease_expires_at=" + rs.getObject("lease_expires_at", OffsetDateTime.class)
+                                + " now=" + rs.getObject("now", OffsetDateTime.class))
+                        .single());
+            }
+            return out.toString();
         }
 
         /**
