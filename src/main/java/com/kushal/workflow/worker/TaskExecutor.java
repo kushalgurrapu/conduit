@@ -21,13 +21,21 @@ import java.util.UUID;
  * are transactions because they go through the {@link TaskService} proxy.
  * The handler runs only after claim has committed, so it does not hold a
  * pooled connection. A finish write that throws is logged and not retried;
- * the row stays {@code RUNNING}.
+ * the row stays {@code RUNNING} until the lease expires and a reaper
+ * requeues it.
+ *
+ * <p>An {@link Error} from the handler that is not a
+ * {@link VirtualMachineError}, and a {@link StackOverflowError}, are one
+ * fail write, with the class name and message as the reason. Any other
+ * {@link VirtualMachineError} propagates from {@link #runOnce}, nothing is
+ * finished, and the row stays {@code RUNNING}.
  *
  * <p>While the handler runs, {@link LeaseHeartbeat} extends the lease from
  * its own thread and connection. The watch is closed on every exit from
  * the handler, including an interrupt and an {@link Error}, before any
  * finish write. A returned outcome is finished even when the lease was
- * lost; the attempt guard decides whether that write lands.
+ * lost; the guard rejects that write once this attempt no longer owns the
+ * row.
  */
 @Component
 public class TaskExecutor {
@@ -66,7 +74,10 @@ public class TaskExecutor {
      * @return {@code false} when there was nothing to claim. {@code true}
      *         when a task was claimed, including when it is left
      *         {@code RUNNING} because the handler was interrupted or the
-     *         finish write threw.
+     *         finish write threw, and when a handler {@link Error} was
+     *         recorded as one fail write. A {@link VirtualMachineError}
+     *         other than {@link StackOverflowError} is thrown instead and
+     *         leaves the row {@code RUNNING}.
      */
     public boolean runOnce(UUID workerId) {
         MDC.put("workerId", String.valueOf(workerId));

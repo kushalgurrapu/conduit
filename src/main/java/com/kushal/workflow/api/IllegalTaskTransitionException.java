@@ -5,7 +5,13 @@ import com.kushal.workflow.task.TaskStatus;
 import java.util.UUID;
 
 /**
- * Cancel was refused because the task is not {@code PENDING}.
+ * Cancel was refused because the task was not {@code PENDING} when the
+ * cancel's update ran.
+ *
+ * <p>The status is the one read after the cancel's update matched nothing.
+ * A cancel that ran while a reap of the row was uncommitted did not wait,
+ * and its read can see the reaped row, so the status can be
+ * {@code PENDING}.
  *
  * <p>The service reports that as a value
  * ({@link com.kushal.workflow.task.CancelResult.NotCancellable}). The

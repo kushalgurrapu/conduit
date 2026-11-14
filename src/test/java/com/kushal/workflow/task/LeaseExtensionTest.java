@@ -28,8 +28,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>A past {@code lease_expires_at} still extends while the row is
  * {@code RUNNING} for that worker and attempt. Expiry is not a new owner.
- * The engine has no {@code RUNNING} to {@code PENDING} path; the requeue
- * in this class is test SQL.
+ * The engine's {@code RUNNING} to {@code PENDING} path is the lease reaper;
+ * the requeue in this class is test SQL, a fixture for a later claim.
  */
 @SpringBootTest
 class LeaseExtensionTest extends PostgresIntegrationTest {
@@ -266,9 +266,10 @@ class LeaseExtensionTest extends PostgresIntegrationTest {
     }
 
     /**
-     * The engine has no {@code RUNNING} to {@code PENDING} path. The update
-     * below is test SQL: it clears the owner fields and leaves {@code attempt}
-     * alone, then the same worker claims again.
+     * The engine's {@code RUNNING} to {@code PENDING} path is the lease
+     * reaper. The update below is a test fixture, not that path: it clears
+     * the owner fields and leaves {@code attempt} alone, then the same
+     * worker claims again.
      */
     @Test
     void sameWorkerRequeueFencesThePreviousAttempt() {

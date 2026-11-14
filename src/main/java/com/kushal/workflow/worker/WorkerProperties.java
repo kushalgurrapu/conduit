@@ -13,9 +13,10 @@ import java.time.Duration;
  *
  * <p>{@code shutdown-timeout} is how long {@link WorkerPool#stop()} waits
  * before interrupting a handler. It is not a limit on how long a handler
- * may run while the process is up. It has to be shorter than
- * {@code spring.lifecycle.timeout-per-shutdown-phase} so Spring does not
- * abandon the shutdown phase first.
+ * may run while the process is up. {@link #validate} requires it to be
+ * shorter than {@code spring.lifecycle.timeout-per-shutdown-phase}.
+ * {@link WorkerPool#stop()} is synchronous, so the phase timeout does not
+ * cut that wait short.
  */
 @Validated
 @ConfigurationProperties(prefix = "engine.worker")
