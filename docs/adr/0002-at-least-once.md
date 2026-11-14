@@ -4,10 +4,11 @@
 
 Accepted
 
-The decision is accepted. Leases and heartbeats exist (M3). The
-mechanisms that would deliver at-least-once execution (recovery,
-retries, idempotency) are **not implemented yet**. See "Current
-implementation versus planned".
+The decision is accepted. Leases and heartbeats exist (M3), and
+recovery of abandoned tasks exists (M4, ADR 0005). The engine is
+at-least-once only in the scope stated under "Current implementation
+versus planned". Retries (M5) and idempotency (M6) are **not
+implemented yet**.
 
 ## Context
 
@@ -62,30 +63,47 @@ sets `TaskContext.leaseLost()`, which asks the handler to stop. The
 handler may ignore it. ADR 0003 describes the `attempt` guard on those
 writes.
 
-**Not implemented:** recovery of abandoned tasks (a reaper or any other
-engine path from `RUNNING` back to `PENDING`), retries, and idempotency
-keys. Those are M4, M5, and M6.
+Since M4, `LeaseReaper` returns a `RUNNING` row whose lease has
+expired to `PENDING`, keeps `attempt`, and records the attempt as
+`LEASE_EXPIRED` in `task_attempts`. A worker claims it again at
+`attempt + 1`, and the old attempt's writes are rejected (ADR 0003,
+ADR 0005). An expired lease makes the row eligible for requeue. It does
+not end ownership: until a reap commits, the old worker can still
+extend, complete, or fail.
 
-A lease that has expired is only a timestamp in the past. It is not lost
-ownership, and nothing reads it to requeue the row. A crash after claim,
-an interrupt during the handler, or a finish write that throws leaves
-the task `RUNNING` with a lease that soon expires. A garbage-collection
-pause or a slow heartbeat can also let the lease expire while the
-handler is alive. In every case the row stays `RUNNING`. The code is not
-at-least-once. A stuck task is lost work until an operator requeues it
-by hand (ADR 0004) or until recovery exists (M4). At-least-once is still
-the target of that later work.
+**At-least-once, as far as M4 goes.** A task is requeued and run again
+when its attempt's lease stops being extended.
+
+- **Tested causes** (`RecoveryIntegrationTest`): a stopped heartbeat
+  with a handler that never returns (a crash or a pause), a handler
+  interrupted at shutdown, and a finish write that did not commit.
+- **Argued from the same mechanism, not tested:** the process is killed
+  after the claim commits. No test kills a JVM.
+- This holds when **all** of these are true: at least one process runs a
+  reaper; at least one worker loop claims; and the handler does not take
+  its worker down on every attempt. An ordinary handler `Error` is a
+  `Failed` finish, but a `VirtualMachineError` other than
+  `StackOverflowError` still kills the loop, and if it repeats on every
+  attempt it keeps killing loops until M5 adds `max_attempts`.
+
+Nothing here bounds how long recovery takes, and nothing stops a
+zombie. ADR 0005 lists what M4 does not provide.
+
+**Not implemented:** retries (M5) and idempotency keys (M6). `FAILED`
+is terminal.
 
 "The handler ran at most once" is this process's control flow. It is not
-a durability guarantee. A manual requeue, or a future reaper, runs the
-handler again.
+a durability guarantee. A reap, or the operator's expire-the-lease
+procedure (ADR 0005), runs the handler again.
 
 ## Consequences
 
 - Task handlers must tolerate being run more than once.
 - Duplicates can also happen without a crash. A slow worker whose lease
-  has expired may still be running while another worker takes over. ADR
-  0003 protects the engine's own state from that worker. It does not undo
+  has expired may still be running when a reaper requeues its task and
+  another worker claims it. Takeover needs that requeue: an expired lease
+  alone does not let another worker claim the row. ADR 0003 protects the
+  engine's own state from the slow worker. It does not undo
   effects the worker already caused outside the engine, which is why
   idempotency is needed as well.
 - Tests and documentation must treat "ran twice" as allowed, and
@@ -102,9 +120,9 @@ handler again.
 ## Future implications
 
 - Leases and heartbeats (M3) give the engine a timestamp after which a
-  worker may be gone. Nothing acts on that timestamp yet.
-- Recovery (M4) will put tasks with an expired lease back into the queue,
-  and retries will bound how many times that happens.
+  worker may be gone. Since M4 the reaper acts on it.
+- Recovery (M4) puts tasks with an expired lease back into the queue.
+  Retries (M5) will bound how many times that happens.
 - Idempotency support will give handlers a stable key per task and attempt
   to pass downstream.
 - Any later step type that calls outside services (for example HTTP) should

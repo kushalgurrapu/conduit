@@ -5,9 +5,9 @@
 Accepted
 
 The `attempt` fence is implemented on lease extension, complete, and
-fail (M3). The proof that it rejects a stale worker after **recovery**
-gives the task to a later claim waits for M4, because nothing in the
-engine requeues a task yet. See "Current implementation versus planned".
+fail (M3). Since M4, the reaper requeues a task whose lease expired, and
+the M4 tests show the fence rejects the stale worker after a later
+claim. See "Current implementation versus planned".
 
 ## Context
 
@@ -15,7 +15,8 @@ Once leases exist, a worker can lose ownership of a task without knowing it:
 
 1. Worker A claims the task.
 2. A stalls (a long garbage-collection pause, a network partition, a
-   stuck call), and its lease expires.
+   stuck call), and its lease expires. A reaper then requeues the task.
+   An expired lease alone does not let anyone else claim it.
 3. Worker B claims the same task. This is a newer attempt.
 4. A wakes up, believes it still owns the task, and writes a result.
 
@@ -79,8 +80,10 @@ and the new execution would then look identical. The pair
   guarded by `id`, `status = 'RUNNING'`, `worker_id`, and `attempt`. It
   sets `lease_expires_at` and `last_heartbeat_at` and returns `false`
   when it matches nothing. It does not require `lease_expires_at >
-  NOW()`, so a lease that is already in the past still extends. With no
-  reaper, an old timestamp does not mean a new owner exists.
+  NOW()`, so a lease that is already in the past still extends. An old
+  timestamp does not mean a new owner exists: an expired lease makes the
+  row eligible for requeue, and ownership ends only when a requeue or the
+  owner's own finish commits (ADR 0005).
 - Complete and fail use the same guard. Zero rows is still a value and
   is not retried. `AlreadyApplied` means this worker **and this attempt**
   already reached the target status. A different attempt is `Rejected`,
@@ -111,11 +114,26 @@ the new attempt completes. `LeaseHeartbeatIntegrationTest` bumps
 `attempt` in SQL while a handler is blocked. The handler sees
 `leaseLost()`, returns success anyway, and its complete matches no row.
 
-**Not implemented:** a reaper or any engine path from `RUNNING` back to
-`PENDING`, so a later claim of the same row cannot happen in production
-yet. The crash test and the zombie test (worker A resumes after worker B
-has claimed the task through recovery) are M4. M4 should find this
-guard already present.
+**What the M4 tests add.** M4 found this guard already present and did
+not change it. It added the reaper (ADR 0005), the first production path
+to a later claim of the same row, and these tests of the fence against
+that claim:
+
+- `RecoveryIntegrationTest` reaps worker A's attempt and then checks A's
+  extend and finish in every state the row can reach: not claimed again
+  (`Rejected(PENDING, null)`), held by B (`Rejected(RUNNING, B)`, and
+  A's extend returns `false` with B's lease unchanged), finished by B
+  (`Rejected(COMPLETED, B)` or `Rejected(FAILED, B)`), cancelled after
+  the reap (`Rejected(CANCELLED, null)`), and claimed again by A's own
+  id (`Rejected(RUNNING, A)`, then `Rejected(COMPLETED, A)`, never
+  `AlreadyApplied`). Each rejected finish leaves the row and its history
+  byte-for-byte unchanged, and the stored result is the later attempt's.
+- `RecoverySoakTest` checks every write in a seeded random walk against
+  the row read just before it: it applies exactly when the row is
+  `RUNNING` with that worker and attempt, and otherwise changes nothing.
+- `RecoveryChaosTest` releases every crashed handler after all tasks
+  completed. Each of their finishes is `Rejected(COMPLETED, <final
+  worker>)`, and the database does not change.
 
 ## Consequences
 
@@ -137,12 +155,13 @@ These are the milestones this decision constrains. The `attempt` column,
 the lease, and the guarded `UPDATE` on extend, complete, and fail exist
 (M3).
 
-- Recovery of abandoned tasks (M4) must put a task back to `PENDING`
-  without resetting `attempt`. The next claim then produces a higher
-  value. The reaper must clear `worker_id`, `claimed_at`,
-  `lease_expires_at`, and `last_heartbeat_at`.
+- Recovery of abandoned tasks (M4) puts a task back to `PENDING`
+  without resetting `attempt`, so the next claim produces a higher
+  value. The reaper clears `worker_id`, `claimed_at`,
+  `lease_expires_at`, and `last_heartbeat_at`. This is done (ADR 0005).
 - Retry limits can be expressed against `attempt`.
-- A history of attempts could be recorded separately if needed.
+- A history of attempts is recorded separately in `task_attempts`, one
+  row per `(task_id, attempt)` (M4, ADR 0005).
 - Workflow advancement (moving to the next step) must happen only if the
   guarded update succeeded.
 - Tests for this should reproduce the stale-worker scenario above and

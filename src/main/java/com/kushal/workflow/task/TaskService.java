@@ -10,11 +10,13 @@ import java.util.Optional;
 import java.util.UUID;
 
 /**
- * Transaction boundary for claim, lease extension, complete, fail, and cancel.
+ * Transaction boundary for claim, lease extension, complete, fail, cancel,
+ * and the lease reap.
  *
  * <p>Each write to {@code tasks} is a single statement. Claim and an applied
  * complete or fail add one {@code task_attempts} statement in the same
- * transaction. {@code tasks} is the source of truth and {@code task_attempts}
+ * transaction. The reap writes both tables in one statement, one transaction
+ * per batch. {@code tasks} is the source of truth and {@code task_attempts}
  * records it: a history write that cannot be made is logged at WARN, and the
  * {@code tasks} change still commits. Call this bean (the Spring proxy).
  * A direct self-call would skip the transaction, so the update, its history

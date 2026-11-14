@@ -121,6 +121,7 @@ class LeaseHeartbeatIntegrationTest extends PostgresIntegrationTest {
         assertEquals(Boolean.FALSE, hold.leaseLostAtReturn.get());
     }
 
+    /** The task stays {@code RUNNING} after expiry only because the reaper is off in this context. */
     @Test
     void withoutHeartbeatsTheLeaseExpiresAndTheTaskStaysRunning() throws Exception {
         hold.reset(false);

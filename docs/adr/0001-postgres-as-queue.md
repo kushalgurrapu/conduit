@@ -28,8 +28,10 @@ PostgreSQL is currently all of the following:
 - **Queue.** A pending task is a row with `status = 'PENDING'`, ordered by
   `created_at`. The partial index `idx_tasks_pending` covers exactly those
   rows.
-- **Coordination and locking.** Claiming is one statement that runs inside
-  the `@Transactional` method `TaskService.claimTask`:
+- **Coordination and locking.** Claiming is one statement on `tasks` that
+  runs inside the `@Transactional` method `TaskService.claimTask`. Since
+  M4 the same transaction also inserts the attempt's history row
+  (ADR 0005). The claim statement, in its original shape:
 
   ```sql
   WITH next_task AS (
@@ -89,15 +91,16 @@ and this ADR does not claim PostgreSQL is the better queue in general.
   or scalability claim is made here.
 - Finished rows stay in the table until something removes them. Retention
   is not handled.
-- A transaction must never stay open while user logic runs. Today the
-  claim transaction covers only the claim statement, and this has to stay
-  true once a worker loop exists.
+- No transaction stays open while user logic runs. The claim transaction
+  holds the claim statement and, since M4, the history insert for that
+  attempt. It commits before the handler starts, and the finish is a
+  separate short transaction.
 
 ## Future implications
 
-- Leases, heartbeats, and the recovery of abandoned tasks (later
-  milestones) will reuse the same pattern: guarded `UPDATE`s and
-  `SKIP LOCKED` scans on `tasks`.
+- Leases and heartbeats (M3) and the recovery of abandoned tasks (M4)
+  reuse the same pattern: guarded `UPDATE`s and `SKIP LOCKED` scans on
+  `tasks`. This is done. The M4 reaper is one such scan (ADR 0005).
 - Fencing (ADR 0003) depends on the guard being part of the same
   statement as the write, which this design makes possible.
 - The decision should be revisited if measurements show the database is
